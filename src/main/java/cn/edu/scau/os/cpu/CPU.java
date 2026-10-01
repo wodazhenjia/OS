@@ -111,21 +111,48 @@ public class CPU {
         return running;
     }
 
+    /** 两个时间单位之间的实际间隔（毫秒），可在运行中随时修改。 */
+    private volatile long periodMillis = 500;
+
+    /**
+     * 运行中调整"时间单位"的实际长度。
+     *
+     * <p>只改这个 volatile 字段，脉冲循环每轮重新读取，因此**不需要**停线程再起线程。
+     * 早期版本用"stop() 再 start()"实现，但 stop() 并不等待旧线程退出，
+     * 而新线程又把 running 置回 true，结果旧线程睡醒后继续循环，
+     * 于是出现多个脉冲线程同时推进模拟（时间片飞转、日志暴涨）。</p>
+     */
+    public void setPeriodMillis(long ms) {
+        this.periodMillis = Math.max(20, ms);
+    }
+
+    public long periodMillis() {
+        return periodMillis;
+    }
+
     /** 启动模拟：CPU() 在不断循环执行。 */
     public void start(long periodMillis) {
         if (thread != null) {
             return;
         }
+        this.periodMillis = Math.max(20, periodMillis);
         running = true;
-        thread = new Thread(() -> CPU(periodMillis), "sim-cpu");
+        thread = new Thread(() -> CPU(this.periodMillis), "sim-cpu");
         thread.setDaemon(true);
         thread.start();
     }
 
+    /** 停止模拟：置标志并等待脉冲线程真正退出，避免留下"野线程"。 */
     public void stop() {
         running = false;
-        if (thread != null) {
-            thread.interrupt();
+        Thread t = thread;
+        if (t != null) {
+            t.interrupt();
+            try {
+                t.join(2000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
             thread = null;
         }
     }
@@ -145,6 +172,7 @@ public class CPU {
      * 单个中央处理器的模拟 —— 无参入口，不断循环执行。
      */
     public void CPU(long periodMillis) {
+        this.periodMillis = Math.max(20, periodMillis);
         while (running) {
             if (paused) {
                 sleep(60);
@@ -158,7 +186,7 @@ public class CPU {
                     lastEvent = "异常：" + e.getMessage();
                 }
             }
-            sleep(periodMillis);
+            sleep(periodMillis());
         }
     }
 

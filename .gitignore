@@ -1,0 +1,18 @@
+# Java / Maven build output
+target/
+out/
+*.class
+
+# IntelliJ IDEA configuration
+.idea/
+*.iml
+
+# Generated runtime data (disk images, logs, screenshots)
+/runtime/
+/src/runtime/
+*.log
+
+# OS metadata
+.DS_Store
+Thumbs.db
+Desktop.ini

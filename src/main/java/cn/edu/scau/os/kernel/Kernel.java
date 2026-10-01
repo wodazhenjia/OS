@@ -173,11 +173,12 @@ public class Kernel implements CPU.Host {
 
     /** 调整"时间单位"的实际长度（毫秒）。 */
     public void setPulseMillis(long ms) {
-        this.pulseMillis = Math.max(20, ms);
-        if (cpu.isRunning()) {
-            cpu.stop();
-            cpu.start(pulseMillis);
+        long v = Math.max(20, ms);
+        if (v == pulseMillis) {
+            return;   // 值没变就不改，也不刷日志
         }
+        pulseMillis = v;
+        cpu.setPeriodMillis(v);   // 只改周期，不重启脉冲线程
         log("时间单位长度调整为 " + pulseMillis + " ms");
     }
 

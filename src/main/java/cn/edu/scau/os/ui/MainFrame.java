@@ -90,6 +90,13 @@ public class MainFrame extends JFrame {
     private final DirectoryTree dirTree = new DirectoryTree();
     private final JCheckBox showFrozen = new JCheckBox("冻结视图（便于观察）");
 
+    /** 时间单位长度范围（毫秒）：50 最快，1500 最慢。 */
+    private static final int MIN_PULSE_MS = 50;
+    private static final int MAX_PULSE_MS = 1500;
+
+    private final JLabel speedValue = new JLabel("  —  ");
+    private JSlider speedSlider;   // 在 buildSouth() 里创建，菜单"调整时间单位长度"也用它
+
     private Kernel.Snapshot last;
 
     public MainFrame(Kernel kernel) {
@@ -131,6 +138,32 @@ public class MainFrame extends JFrame {
             kernel.cpu().setPaused(!kernel.cpu().isPaused());
             appendLog(kernel.cpu().isPaused() ? "模拟已暂停" : "模拟已继续");
         });
+        JMenuItem rate = new JMenuItem("调整时间单位长度…");
+        rate.addActionListener(e -> {
+            final JSlider s = new JSlider(MIN_PULSE_MS, MAX_PULSE_MS,
+                    (int) Math.max(MIN_PULSE_MS, Math.min(MAX_PULSE_MS, kernel.pulseMillis())));
+            s.setInverted(true);          // 与底部滑块一致：向左更慢
+            s.setMajorTickSpacing(250);
+            s.setPaintTicks(true);
+            s.setPaintLabels(true);
+            final JLabel show = new JLabel(speedText(s.getValue()), JLabel.CENTER);
+            s.addChangeListener(ev -> show.setText(speedText(s.getValue())));
+            JPanel box = new JPanel(new BorderLayout(4, 6));
+            box.add(new JLabel("向左＝一个时间单位更长（更慢），向右＝更短（更快）："), BorderLayout.NORTH);
+            box.add(s, BorderLayout.CENTER);
+            box.add(show, BorderLayout.SOUTH);
+            int ok = JOptionPane.showConfirmDialog(this, box, "调整时间单位长度",
+                    JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE);
+            if (ok == JOptionPane.OK_OPTION) {
+                int v = s.getValue();
+                if (speedSlider != null) {
+                    speedSlider.setValue(v);       // 由监听器统一改周期并刷新标签
+                } else {
+                    kernel.setPulseMillis(v);
+                }
+                appendLog("时间单位长度：" + speedText(v));
+            }
+        });
         JMenuItem step = new JMenuItem("单步执行一个时间单位");
         step.addActionListener(e -> {
             boolean was = kernel.cpu().isPaused();
@@ -169,6 +202,7 @@ public class MainFrame extends JFrame {
         });
         sim.add(pause);
         sim.add(step);
+        sim.add(rate);
         sim.addSeparator();
         sim.add(editor);
         sim.addSeparator();
@@ -298,11 +332,36 @@ public class MainFrame extends JFrame {
         cmdRow.add(buttons, BorderLayout.EAST);
 
         JPanel speed = new JPanel(new BorderLayout(6, 0));
-        JSlider slider = new JSlider(50, 1500, 500);
-        slider.setInverted(true);
-        slider.addChangeListener(e -> kernel.setPulseMillis(slider.getValue()));
-        speed.add(new JLabel("时间单位长度（脉冲 ms，向左=更慢）"), BorderLayout.WEST);
-        speed.add(slider, BorderLayout.CENTER);
+        JLabel speedCaption = new JLabel("时间单位长度：");
+        speedSlider = new JSlider(MIN_PULSE_MS, MAX_PULSE_MS,
+                (int) Math.max(MIN_PULSE_MS, Math.min(MAX_PULSE_MS, kernel.pulseMillis())));
+        // 反过来放：向左 = 更长 = 更慢，向右 = 更短 = 更快
+        speedSlider.setInverted(true);
+        speedSlider.setMajorTickSpacing(250);
+        speedSlider.setPaintTicks(true);
+        speedSlider.setToolTipText(pulseTooltip(speedSlider.getValue()));
+        speedSlider.addChangeListener(e -> {
+            int v = speedSlider.getValue();
+            speedSlider.setToolTipText(pulseTooltip(v));
+            kernel.setPulseMillis(v);
+            updateSpeedText();
+        });
+
+        JPanel speedLabels = new JPanel(new BorderLayout());
+        JLabel slow = new JLabel("慢 1500");
+        slow.setFont(speedCaption.getFont().deriveFont(11f));
+        JLabel fast = new JLabel("50 快");
+        fast.setFont(speedCaption.getFont().deriveFont(11f));
+        speedLabels.add(slow, BorderLayout.WEST);
+        speedLabels.add(fast, BorderLayout.EAST);
+
+        JPanel speedBody = new JPanel(new BorderLayout());
+        speedBody.add(speedLabels, BorderLayout.NORTH);
+        speedBody.add(speedSlider, BorderLayout.CENTER);
+
+        speed.add(speedCaption, BorderLayout.WEST);
+        speed.add(speedBody, BorderLayout.CENTER);
+        speed.add(speedValue, BorderLayout.EAST);
 
         JPanel north = new JPanel(new GridLayout(2, 1, 0, 4));
         north.add(cmdRow);
@@ -421,8 +480,35 @@ public class MainFrame extends JFrame {
         render(s);
     }
 
+    // ==================================================================
+    // 时间单位长度（脉冲周期）
+    // ==================================================================
+
+    /** 顶部/右侧的当前速度文字，例如 "500 ms/单位（≈2.0 单位/秒）"。 */
+    private String speedText(int ms) {
+        if (ms <= 0) {
+            return "—";
+        }
+        return ms + " ms/单位（≈" + String.format("%.1f", 1000.0 / ms) + " 单位/秒）";
+    }
+
+    private String pulseTooltip(int ms) {
+        return "一个时间单位 = " + speedText(ms) + "；向左拖动变慢，向右拖动变快";
+    }
+
+    /** 把当前实际周期同步显示到滑块右侧标签（供滑块/菜单/刷新三处调用）。 */
+    private void updateSpeedText() {
+        long ms = kernel.pulseMillis();
+        speedValue.setText("  " + speedText((int) ms) + "  ");
+        if (speedSlider != null && speedSlider.getValue() != ms
+                && ms >= MIN_PULSE_MS && ms <= MAX_PULSE_MS) {
+            speedSlider.setValue((int) ms);
+        }
+    }
+
     private void render(Kernel.Snapshot s) {
         clockValue.setText(String.valueOf(s.systemClock()));
+        updateSpeedText();
         Kernel.PcbView running = s.pcbs().stream().filter(p -> "运行".equals(p.state())).findFirst().orElse(null);
         runningValue.setText(running == null ? "—" : "P" + running.pid() + "  " + running.name());
         sliceValue.setText(running == null ? "—" : String.valueOf(running.timeSliceLeft()));

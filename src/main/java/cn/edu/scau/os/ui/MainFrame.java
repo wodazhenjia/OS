@@ -1,7 +1,6 @@
 package cn.edu.scau.os.ui;
 
 import cn.edu.scau.os.disk.DiskLayout;
-import cn.edu.scau.os.disk.FileSystem;
 import cn.edu.scau.os.kernel.Kernel;
 import cn.edu.scau.os.instruction.Assembler;
 import cn.edu.scau.os.storage.MemoryManager;
@@ -30,8 +29,6 @@ import javax.swing.JTree;
 import javax.swing.SwingUtilities;
 import javax.swing.Timer;
 import javax.swing.border.TitledBorder;
-import javax.swing.tree.DefaultMutableTreeNode;
-import javax.swing.tree.DefaultTreeModel;
 import java.awt.BorderLayout;
 import java.awt.Color;
 import java.awt.Dimension;
@@ -90,7 +87,7 @@ public class MainFrame extends JFrame {
     private final DrawPanel memPanel = new DrawPanel();
     private final DrawPanel diskPanel = new DrawPanel();
 
-    private final JTree dirTree = new JTree(new DefaultMutableTreeNode("加载中…"));
+    private final DirectoryTree dirTree = new DirectoryTree();
     private final JCheckBox showFrozen = new JCheckBox("冻结视图（便于观察）");
 
     private Kernel.Snapshot last;
@@ -423,7 +420,7 @@ public class MainFrame extends JFrame {
         diskText.setText(formatDisk(s));
         pcbArea.setText(formatPcbs(s));
 
-        updateTree(s);
+        dirTree.update(s.rootChildren());
         memPanel.setOwners(s.memoryOwners());
         diskPanel.setFat(s.fat());
         memPanel.repaint();
@@ -523,37 +520,6 @@ public class MainFrame extends JFrame {
                     p.memSize() == 0 ? "—" : p.memBase() + "+" + p.memSize()));
         }
         return sb.toString();
-    }
-
-    private void updateTree(Kernel.Snapshot s) {
-        if (s.rootChildren().isEmpty()) {
-            return;
-        }
-        // 用根节点包裹全部顶层项
-        DefaultMutableTreeNode root = new DefaultMutableTreeNode("/ (根目录, 盘块 " + DiskLayout.ROOT_BLOCK + ")");
-        for (FileSystem.DirNode child : s.rootChildren()) {
-            root.add(toNode(child));
-        }
-        dirTree.setModel(new DefaultTreeModel(root));
-        if (expandOnce) {
-            for (int i = 0; i < dirTree.getRowCount(); i++) {
-                dirTree.expandRow(i);
-            }
-            expandOnce = false;
-        }
-    }
-
-    private boolean expandOnce = true;
-
-    private static DefaultMutableTreeNode toNode(FileSystem.DirNode n) {
-        String label = n.directory()
-                ? n.name() + "/  [" + n.attributes() + ", 盘块 " + n.startBlock() + "]"
-                : n.name() + "  (" + n.length() + "B, 盘块 " + n.startBlock() + ")";
-        DefaultMutableTreeNode node = new DefaultMutableTreeNode(label);
-        for (FileSystem.DirNode c : n.children()) {
-            node.add(toNode(c));
-        }
-        return node;
     }
 
     // ==================================================================

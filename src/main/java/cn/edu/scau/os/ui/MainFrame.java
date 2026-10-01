@@ -144,6 +144,20 @@ public class MainFrame extends JFrame {
             kernel.cpu().setPaused(was);
             refresh();
         });
+        JMenuItem editor = new JMenuItem("汇编编辑器（写源码 → 编译 → 保存为 .e）");
+        editor.addActionListener(e -> {
+            appendLog("打开汇编编辑器：源码按行编写，// 或 # 之后为注释；"
+                    + "保存后可用 create 命令创建进程运行。");
+            AsmEditorDialog dialog = new AsmEditorDialog(this, kernel);
+            dialog.addWindowListener(new java.awt.event.WindowAdapter() {
+                @Override
+                public void windowClosed(java.awt.event.WindowEvent ev) {
+                    refresh();
+                    appendLog("汇编编辑器已关闭。");
+                }
+            });
+            dialog.setVisible(true);
+        });
         JMenuItem reset = new JMenuItem("重新初始化（格式化磁盘并重建演示数据）");
         reset.addActionListener(e -> {
             kernel.initialize((int) System.currentTimeMillis());
@@ -158,6 +172,8 @@ public class MainFrame extends JFrame {
         });
         sim.add(pause);
         sim.add(step);
+        sim.addSeparator();
+        sim.add(editor);
         sim.addSeparator();
         sim.add(reset);
         sim.addSeparator();
@@ -393,7 +409,8 @@ public class MainFrame extends JFrame {
         refresh();
     }
 
-    private void appendLog(String text) {
+    /** 供其他窗口（如汇编编辑器）向主窗口日志追加内容。 */
+    public void appendLog(String text) {
         cmdLog.append(text.endsWith("\n") ? text : text + "\n");
         cmdLog.setCaretPosition(cmdLog.getDocument().getLength());
     }

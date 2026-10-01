@@ -30,6 +30,10 @@ import java.awt.FlowLayout;
 import java.awt.Font;
 import java.awt.Frame;
 import java.awt.GridLayout;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 
 /**
  * 汇编编辑器对话框：左侧写源码，右侧实时看编译结果，点一下就存成磁盘上的可执行文件。
@@ -123,6 +127,14 @@ public class AsmEditorDialog extends JDialog implements DocumentListener {
                     """}
     };
 
+    /**
+     * 源码存档文件名（放在 {@code runtime/} 下，与模拟磁盘同目录）。
+     * 命名为 8.3 风格而不是 {@code .java/.txt}，是为了和项目里模拟磁盘的
+     * "3 字符主名 + 1 字符扩展名"约束保持一致，避免和真实源码混淆。
+     */
+    private static final String SOURCE_FILE_NAME = "PmPt.asm";
+    private static final String LEGACY_SOURCE_FILE_NAME = "PmPt.txt";
+
     private final Kernel kernel;
 
     private final JTextArea sourceArea = new JTextArea();
@@ -134,9 +146,11 @@ public class AsmEditorDialog extends JDialog implements DocumentListener {
     private final JTextArea disasmArea = monoArea(8);
     private final JTextArea hexArea = monoArea(3);
     private final JLabel status = new JLabel(" ");
+    private final JLabel sourceFileLabel = new JLabel(" ");
 
     private Assembler.Result lastResult;
     private boolean disposed;
+    private boolean sourceDirty;
 
     public AsmEditorDialog(Frame owner, Kernel kernel) {
         super(owner, "汇编编辑器 —— 源码 → 机器码 → 磁盘 .e 文件", false);
@@ -144,7 +158,7 @@ public class AsmEditorDialog extends JDialog implements DocumentListener {
 
         sourceArea.setFont(MONO);
         sourceArea.setTabSize(4);
-        sourceArea.setText(DEFAULT_SOURCE);
+        sourceArea.setText(loadInitialSource());
         sourceArea.setCaretPosition(0);
         errorArea.setForeground(new Color(0xB0, 0x1B, 0x1B));
 
@@ -158,6 +172,8 @@ public class AsmEditorDialog extends JDialog implements DocumentListener {
         setSize(980, 660);
         setLocationRelativeTo(owner);
         sourceArea.getDocument().addDocumentListener(this);
+        sourceDirty = false;
+        updateSourceFileLabel();
         doCompile();
     }
 
@@ -193,9 +209,10 @@ public class AsmEditorDialog extends JDialog implements DocumentListener {
         example.addActionListener(e -> showExamples(example));
         panel.add(example);
 
-        JLabel hint = new JLabel("（保存后可用 create 命令创建进程运行；模拟运行中保存亦安全）");
+        JLabel hint = new JLabel("（源码自动存档，重启后自动载回；保存后可用 create 命令创建进程运行）");
         hint.setForeground(Color.GRAY);
         panel.add(hint);
+        panel.add(sourceFileLabel);
         return panel;
     }
 
@@ -310,6 +327,7 @@ public class AsmEditorDialog extends JDialog implements DocumentListener {
 
         errorArea.setText(r.errors().isEmpty() ? "" : String.join("\n", r.errors()));
         errorArea.setCaretPosition(0);
+        updateSourceFileLabel();
 
         if (r.ok()) {
             status.setForeground(new Color(0x1B, 0x6B, 0x2A));
@@ -346,10 +364,12 @@ public class AsmEditorDialog extends JDialog implements DocumentListener {
             warn("保存失败：" + ex.getMessage());
             return;
         }
+        persistSource();
 
         String msg = "已保存 " + path + "\n"
                 + "机器码 " + r.code().length + " 字节（磁盘块 64 字节，占用 "
-                + (int) Math.ceil(r.code().length / 64.0) + " 块）\n\n"
+                + (int) Math.ceil(r.code().length / 64.0) + " 块）\n"
+                + sourceFileMessage() + "\n\n"
                 + "现在创建进程运行它吗？";
         int choice = JOptionPane.showConfirmDialog(this, msg, "编译并保存",
                 JOptionPane.YES_NO_OPTION, JOptionPane.INFORMATION_MESSAGE);
@@ -361,6 +381,94 @@ public class AsmEditorDialog extends JDialog implements DocumentListener {
                 warn("进程创建失败（PCB 已满或文件不可读），请查看主窗口日志。");
             }
         }
+    }
+
+    // ==================================================================
+    // 源码存档：让编辑器里的源码在重启后还在
+    // ==================================================================
+
+    /**
+     * 源码存档文件（默认 {@code runtime/PmPt.asm}）。找不到可用位置时返回 null，
+     * 此时编辑器仍可用，只是源码不跨次启动保留。
+     */
+    private static Path resolveSourceFile() {
+        Path runtimeDir = Paths.get("runtime");
+        Path preferred = runtimeDir.resolve(SOURCE_FILE_NAME);
+        if (Files.isRegularFile(preferred)) {
+            return preferred;
+        }
+        Path legacy = runtimeDir.resolve(LEGACY_SOURCE_FILE_NAME);
+        if (Files.isRegularFile(legacy)) {
+            return legacy;
+        }
+        if (Files.isDirectory(runtimeDir)) {
+            return preferred;
+        }
+        return Paths.get(System.getProperty("java.io.tmpdir"), SOURCE_FILE_NAME);
+    }
+
+    /** 打开对话框时的初始源码：有存档就用存档，否则用内置模板。 */
+    private static String loadInitialSource() {
+        Path file = resolveSourceFile();
+        if (file != null && Files.isRegularFile(file)) {
+            String text = readSourceFile(file);
+            if (text != null && !text.isBlank()) {
+                return text;
+            }
+        }
+        return DEFAULT_SOURCE;
+    }
+
+    static String readSourceFile(Path file) {
+        try {
+            return Files.readString(file, StandardCharsets.UTF_8);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** 把当前源码写回存档文件；返回写到哪儿（null = 写失败）。 */
+    private Path persistSource() {
+        Path file = resolveSourceFile();
+        if (file == null || !writeSourceFile(file, sourceArea.getText())) {
+            return null;
+        }
+        sourceDirty = false;
+        return file;
+    }
+
+    static boolean writeSourceFile(Path file, String text) {
+        try {
+            Path parent = file.getParent();
+            if (parent != null) {
+                Files.createDirectories(parent);
+            }
+            Files.writeString(file, text, StandardCharsets.UTF_8);
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** 顶部状态标签：告知源码存档在哪儿。 */
+    private void updateSourceFileLabel() {
+        Path file = resolveSourceFile();
+        if (file == null) {
+            sourceFileLabel.setText("（无源码存档，源码不跨次启动保留）");
+            sourceFileLabel.setForeground(new Color(0xB0, 0x1B, 0x1B));
+            return;
+        }
+        sourceFileLabel.setText("源码存档 → " + file.toAbsolutePath());
+        sourceFileLabel.setForeground(new Color(0x1B, 0x6B, 0x2A));
+    }
+
+    /** "编译并保存"确认框里显示的一行存档位置说明。 */
+    private String sourceFileMessage() {
+        Path file = resolveSourceFile();
+        if (file == null) {
+            return "（源码未能存档，本次编辑不会保留）";
+        }
+        return "源码已存档 → " + file.toAbsolutePath();
     }
 
     // ==================================================================
@@ -408,11 +516,13 @@ public class AsmEditorDialog extends JDialog implements DocumentListener {
 
     @Override
     public void insertUpdate(DocumentEvent e) {
+        sourceDirty = true;
         doCompile();
     }
 
     @Override
     public void removeUpdate(DocumentEvent e) {
+        sourceDirty = true;
         doCompile();
     }
 
@@ -425,6 +535,10 @@ public class AsmEditorDialog extends JDialog implements DocumentListener {
     public void dispose() {
         disposed = true;
         sourceArea.getDocument().removeDocumentListener(this);
+        // 关窗口时把没保存过的编辑也存档，下次打开还在
+        if (sourceDirty) {
+            persistSource();
+        }
         super.dispose();
     }
 

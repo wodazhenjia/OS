@@ -47,14 +47,15 @@ public final class SimOsApp {
                 selfTest(ticks);
                 return;
             }
-            default -> launchGui();
+            case "" -> launchGui();
+            default -> throw new IllegalArgumentException("未知参数，请使用 --help");
         }
     }
 
     private static void launchGui() throws Exception {
         Path disk = resolveDiskFile();
         Kernel kernel = new Kernel(disk);
-        kernel.initialize(20260501);
+        kernel.boot(20260501);
         kernel.start(500);
 
         SwingUtilities.invokeLater(() -> {
@@ -87,9 +88,10 @@ public final class SimOsApp {
     // 无界面自检
     // ==================================================================
 
-    private static void selfTest(int ticks) {
+    private static void selfTest(int ticks) throws java.io.IOException {
+        if (ticks <= 0) throw new IllegalArgumentException("自检时钟单位数必须为正数");
         System.out.println("================ SimOS 自检开始 ================");
-        Path disk = resolveDiskFile();
+        Path disk = Files.createTempDirectory("simos-selftest-").resolve("disk.img");
         Kernel kernel = new Kernel(disk);
         int pass = 0;
         int fail = 0;
@@ -109,7 +111,7 @@ public final class SimOsApp {
         } else {
             fail++;
         }
-        byte[] expect = {0x05, 0x40, 0x42, 0x03, 0x41, 0x45};
+        byte[] expect = {0x05, 0x64, (byte) 0x83, 0x65, 0x66};
         boolean same = r.code().length == expect.length;
         for (int i = 0; same && i < expect.length; i++) {
             same = r.code()[i] == expect[i];
@@ -121,13 +123,13 @@ public final class SimOsApp {
             fail++;
         }
         String dis = Assembler.disassemble(expect);
-        report(dis.contains("x=5") && dis.contains("!A? 3") && dis.contains("end"), "反汇编：\n" + dis);
-        if (dis.contains("x=5") && dis.contains("!A? 3")) {
+        report(dis.contains("x=5") && dis.contains("!A3") && dis.contains("end"), "反汇编：\n" + dis);
+        if (dis.contains("x=5") && dis.contains("!A3")) {
             pass++;
         } else {
             fail++;
         }
-        Assembler.Result bad = Assembler.assemble("x=99");
+        Assembler.Result bad = Assembler.assemble("x=100");
         report(!bad.ok(), "越界赋值被拒绝：" + bad.errors());
         if (!bad.ok()) {
             pass++;
@@ -236,8 +238,8 @@ public final class SimOsApp {
             fail++;
         }
         cr = kernel.exec("type /aa/bad.e");
-        report(cr.ok() && cr.message().contains("!A? 3"), "type /aa/bad.e 显示反汇编");
-        if (cr.ok() && cr.message().contains("!A? 3")) {
+        report(cr.ok() && cr.message().contains("!A3"), "type /aa/bad.e 显示反汇编");
+        if (cr.ok() && cr.message().contains("!A3")) {
             pass++;
         } else {
             fail++;

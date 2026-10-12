@@ -43,6 +43,16 @@ public class Scheduler {
         }
     }
 
+    public void reset() {
+        readyQueue.clear();
+        blockedQueue.clear();
+        runningPid = -1;
+        for (int i = 0; i < pcbs.length; i++) {
+            pcbs[i].reset();
+            pcbs[i].pid = i;
+        }
+    }
+
     public PCB[] pcbs() {
         return pcbs;
     }

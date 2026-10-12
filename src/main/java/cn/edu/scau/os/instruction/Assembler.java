@@ -58,8 +58,8 @@ public final class Assembler {
 
     /** 把一行源码编码进 code，并追加清单行。 */
     private static void encodeOne(String line, List<Byte> code, List<String> listing, int at) {
-        String t = line.replace(" ", "");
-        String lower = t.toLowerCase();
+        String t = line.replaceAll("\\s+", "");
+        String lower = t.toLowerCase(java.util.Locale.ROOT);
 
         if (lower.equals("end")) {
             code.add((byte) Opcode.OP_END);
@@ -78,23 +78,22 @@ public final class Assembler {
         }
         if (lower.startsWith("x=")) {
             int v = parseInt(lower.substring(2), "赋值立即数");
-            requireRange(v, 0, Opcode.OPERAND_MASK, "赋值立即数 x=? 只支持 0~63（低 6 位）");
+            requireRange(v, 0, Opcode.OPERAND_MASK, "赋值立即数 x=? 支持 0~99");
             int b = Opcode.OP_ASSIGN | v;
             code.add((byte) b);
             listing.add(hex(at) + ": " + mn(b) + "\t(1B)\tx=" + v);
             return;
         }
         if (lower.startsWith("!")) {
-            if (lower.length() < 3) {
+            if (lower.length() != 3) {
                 throw new IllegalArgumentException("设备指令格式应为 !A3 / !B5 / !C2");
             }
             char dev = lower.charAt(1);
             int opcode = Opcode.deviceOpcode(String.valueOf(dev));
             int dur = parseInt(lower.substring(2), "设备使用时间");
-            requireRange(dur, 0, Opcode.OPERAND_MASK, "设备使用时间支持 0~63");
-            code.add((byte) opcode);
-            code.add((byte) dur);
-            listing.add(hex(at) + ": " + mn(opcode) + " " + dur + "\t(2B)\t!" + Character.toUpperCase(dev) + dur);
+            requireRange(dur, 0, 9, "设备使用时间必须是一位整数 0~9");
+            code.add((byte) (opcode | dur));
+            listing.add(hex(at) + ": " + mn(opcode | dur) + "\t(1B)\t!" + Character.toUpperCase(dev) + dur);
             return;
         }
         throw new IllegalArgumentException("无法识别的指令（仅支持 x=? / x++ / x-- / !A? / !B? / !C? / end）");
@@ -106,14 +105,8 @@ public final class Assembler {
         int pc = 0;
         while (pc < code.length) {
             int b = code[pc] & 0xFF;
-            if (Opcode.isDevice(b)) {
-                int dur = (pc + 1 < code.length) ? (code[pc + 1] & 0xFF) : -1;
-                sb.append(String.format("%04X: %s %s%n", pc, Opcode.mnemonic(b), dur < 0 ? "<缺失参数>" : dur));
-                pc += 2;
-            } else {
-                sb.append(String.format("%04X: %s%n", pc, Opcode.mnemonic(b)));
-                pc += 1;
-            }
+            sb.append(String.format("%04X: %s%n", pc, Opcode.mnemonic(b)));
+            pc++;
         }
         return sb.toString();
     }
@@ -121,10 +114,6 @@ public final class Assembler {
     /** 解码偏移 offset 处的一条指令；不检查是否越界（由调用者保证）。 */
     public static Instruction decode(byte[] code, int offset) {
         int b = code[offset] & 0xFF;
-        if (Opcode.isDevice(b)) {
-            int dur = (offset + 1 < code.length) ? (code[offset + 1] & 0xFF) : 0;
-            return new Instruction(offset, b, dur, 2, Opcode.mnemonic(b) + " " + dur);
-        }
         return new Instruction(offset, b, Opcode.operand(b), 1, Opcode.mnemonic(b));
     }
 

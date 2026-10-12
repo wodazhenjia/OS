@@ -91,35 +91,10 @@ public final class SeedBuilder {
                     x=8
                     end
                     """, "先申请 B 设备 2 个时间单位，再赋值"),
-            new Prog("/bin/lng.e", """
-                    x=1
-                    x++
-                    x++
-                    x++
-                    x++
-                    x++
-                    x++
-                    x++
-                    x++
-                    x++
-                    x++
-                    x++
-                    x++
-                    x++
-                    x++
-                    x++
-                    x++
-                    x++
-                    x++
-                    x++
-                    end
-                    """, "较长程序：验证多盘块链接与多次时间片切换"),
-            new Prog("/bin/mem.e", """
-                    x=4
-                    x++
-                    x++
-                    end
-                    """, "内存占用约 3 字节，便于观察内存分配")
+            new Prog("/bin/lng.e", "x=1\n" + "x++\n".repeat(70) + "end\n",
+                    "72字节：验证跨64字节盘块和多次时间片切换"),
+            new Prog("/bin/mem.e", "x=4\n" + "x++\n".repeat(108) + "end\n",
+                    "110字节：观察内存不足等待和释放后唤醒")
     );
 
     /** 把全部演示数据写入已经 format 过的文件系统。 */
@@ -132,7 +107,7 @@ public final class SeedBuilder {
         fs.createDirectory("/doc");
 
         // ---- 10 个可执行文件 ----
-        // 根目录的 8 个登记项被 5 个目录 + 3 个文件占满，其余可执行文件放进子目录。
+        // 根目录使用5个目录和2个文件登记项，留下一个空位。
         for (Prog p : PROGRAMS) {
             Assembler.Result r = Assembler.assemble(p.source());
             if (!r.ok()) {
@@ -146,7 +121,7 @@ public final class SeedBuilder {
         // 指导书本身也只用扩展名区分"可执行文件(e)"与"目录(无扩展名)"，
         // 因此普通文本文件一律不带扩展名。
         writeText(fs, "/doc/rme", "README：用文件模拟磁盘，盘块 64 字节，共 256 块。");
-        writeText(fs, "/doc/fat", "FAT 每项 1 字节：0 空闲，1~252 下一盘块，253 系统保留，254 坏块，255 结束。");
+        writeText(fs, "/doc/fat", "FAT：0 空闲，1 结束，2 坏块，3 系统保留，5~255 下一盘块。");
         writeText(fs, "/doc/aaa", "aaa");
         writeText(fs, "/doc/bbb", "bbb");
         writeText(fs, "/dd/cfg", "配置：时间片=6，进程上限=10，用户区=512 字节。");
@@ -156,7 +131,7 @@ public final class SeedBuilder {
     }
 
     private static void writeText(FileSystem fs, String path, String text) {
-        fs.createFile(path, DiskLayout.ATTR_NORMAL, text.getBytes(StandardCharsets.US_ASCII));
+        fs.createFile(path, DiskLayout.ATTR_NORMAL, text.getBytes(StandardCharsets.UTF_8));
     }
 
     /** 演示程序数量，供自检输出。 */

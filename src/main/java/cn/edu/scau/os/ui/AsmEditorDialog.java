@@ -43,12 +43,12 @@ import java.nio.file.Paths;
  * <pre>
  *   源码编辑（每行一条指令，支持 // 与 # 注释）
  *        ↓ Assembler.assemble（编译，语法错误按行号报出）
- *   机器码（1 字节/条，!A? 设备指令 2 字节）+ 反汇编清单 + 十六进制转储
+ *   机器码（所有指令1字节/条）+ 反汇编清单 + 十六进制转储
  *        ↓ Kernel.assembleAndSave（校验文件名 → 父目录必须存在 → 写入磁盘块）
- *   磁盘上的 .e 可执行文件（可用 create 命令创建进程运行）
+ *   磁盘上的 .e 可执行文件（可用 run 命令创建进程运行）
  * </pre>
  *
- * <p>设计说明：本对话框是非模态的，打开时模拟仍在推进，方便"改一行 → 存盘 → 立刻 create"。
+ * <p>设计说明：本对话框是非模态的，打开时模拟仍在推进，方便"改一行 → 存盘 → 立刻 run"。
  * 保存动作不持有内核锁，依赖 {@link Kernel#assembleAndSave} 内部的加锁语义，
  * 因此与脉冲线程（心跳）不会互相破坏。</p>
  */
@@ -89,7 +89,7 @@ public class AsmEditorDialog extends JDialog implements DocumentListener {
     /** 默认源码：一段含设备申请的小程序，直接可用作模板。 */
     private static final String DEFAULT_SOURCE = """
             // 汇编源码：每行一条指令；// 或 # 之后是注释
-            x=3          // 立即数 0~63
+            x=3          // 立即数 0~99
             x++
             !A2          // 申请 A 设备 2 个时间单位
             x--
@@ -209,7 +209,7 @@ public class AsmEditorDialog extends JDialog implements DocumentListener {
         example.addActionListener(e -> showExamples(example));
         panel.add(example);
 
-        JLabel hint = new JLabel("（源码自动存档，重启后自动载回；保存后可用 create 命令创建进程运行）");
+        JLabel hint = new JLabel("（源码自动存档，重启后自动载回；保存后可用 run 命令创建进程运行）");
         hint.setForeground(Color.GRAY);
         panel.add(hint);
         panel.add(sourceFileLabel);
@@ -269,7 +269,7 @@ public class AsmEditorDialog extends JDialog implements DocumentListener {
     private void chooseDirectory() {
         java.util.List<String> dirs = new java.util.ArrayList<>();
         dirs.add("/");
-        collectDirs(DiskLayout.ROOT_BLOCK, "", dirs);
+        synchronized (kernel.lock()) { collectDirs(DiskLayout.ROOT_BLOCK, "", dirs); }
         Object choice = JOptionPane.showInputDialog(this, "选择保存目录：", "已存在目录",
                 JOptionPane.PLAIN_MESSAGE, null, dirs.toArray(new String[0]), dirs.get(0));
         if (choice != null) {
@@ -364,12 +364,12 @@ public class AsmEditorDialog extends JDialog implements DocumentListener {
             warn("保存失败：" + ex.getMessage());
             return;
         }
-        persistSource();
+        Path savedSource = persistSource();
 
         String msg = "已保存 " + path + "\n"
                 + "机器码 " + r.code().length + " 字节（磁盘块 64 字节，占用 "
-                + (int) Math.ceil(r.code().length / 64.0) + " 块）\n"
-                + sourceFileMessage() + "\n\n"
+                + Math.max(1, (r.code().length + 63) / 64) + " 块）\n"
+                + (savedSource == null ? "源码存档失败：模拟.e文件已保存，但源码未存档。" : "源码已存档 → " + savedSource.toAbsolutePath()) + "\n\n"
                 + "现在创建进程运行它吗？";
         int choice = JOptionPane.showConfirmDialog(this, msg, "编译并保存",
                 JOptionPane.YES_NO_OPTION, JOptionPane.INFORMATION_MESSAGE);
@@ -460,15 +460,6 @@ public class AsmEditorDialog extends JDialog implements DocumentListener {
         }
         sourceFileLabel.setText("源码存档 → " + file.toAbsolutePath());
         sourceFileLabel.setForeground(new Color(0x1B, 0x6B, 0x2A));
-    }
-
-    /** "编译并保存"确认框里显示的一行存档位置说明。 */
-    private String sourceFileMessage() {
-        Path file = resolveSourceFile();
-        if (file == null) {
-            return "（源码未能存档，本次编辑不会保留）";
-        }
-        return "源码已存档 → " + file.toAbsolutePath();
     }
 
     // ==================================================================

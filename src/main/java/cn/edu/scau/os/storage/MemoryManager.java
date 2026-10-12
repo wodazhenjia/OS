@@ -1,215 +1,125 @@
 package cn.edu.scau.os.storage;
 
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.LinkedList;
 import java.util.List;
 
-/**
- * 存储管理：主存用户区 512 字节 + 动态分区 + 首次适应（First Fit）分配与回收 + 存储保护。
- *
- * <p>指导书要求：</p>
- * <ul>
- *   <li>用链表模拟内存空间分配表；采用动态分区存储管理方式；首次适应、下次适应、最佳适配均可；</li>
- *   <li>主存分为系统区（PCB 区 + 内存分配表）与用户区；<b>用户区数组大小为 512 字节</b>；</li>
- *   <li>示例：36 字节的 bb.e 分配 36 字节；110 字节的 cc.e 若空间不足则"无法载入内存"而等待。</li>
- * </ul>
- *
- * <p>本实现同时保留"空闲分区链表"与"按字节占用表"两份视图：前者用于分配算法，
- * 后者直接支撑界面上的彩色内存示意图。</p>
- */
+/** 512字节用户区、链表动态分区表和基址/限长保护。调用者持有内核模拟锁。 */
 public class MemoryManager {
-
-    /** 用户区总容量（字节）。 */
     public static final int USER_AREA_SIZE = 512;
-
-    /** 一个内存分区。 */
     public static final class Partition {
         public int start;
         public int size;
-        public int pid = -1; // -1 表示空闲
-
-        Partition(int start, int size) {
-            this.start = start;
-            this.size = size;
-        }
-
-        public boolean isFree() {
-            return pid < 0;
-        }
-
-        public int end() {
-            return start + size - 1;
-        }
-
-        @Override
+        public int pid = -1;
+        Partition(int start, int size) { this.start = start; this.size = size; }
+        public boolean isFree() { return pid < 0; }
+        public int end() { return start + size - 1; }
         public String toString() {
-            return isFree()
-                    ? String.format("空闲[%d..%d] %dB", start, end(), size)
+            return isFree() ? String.format("空闲[%d..%d] %dB", start, end(), size)
                     : String.format("P%d[%d..%d] %dB", pid, start, end(), size);
         }
     }
-
-    /** 分配算法。 */
-    public enum Fit {FIRST, NEXT, BEST}
-
-    private final List<Partition> partitions = new ArrayList<>();
+    public enum Fit { FIRST, NEXT, BEST }
+    private final LinkedList<Partition> partitions = new LinkedList<>();
+    private final byte[] userArea = new byte[USER_AREA_SIZE];
     private Fit fit = Fit.FIRST;
-    private int nextFitCursor;
+    private int nextFitAddress;
 
-    public MemoryManager() {
+    public MemoryManager() { reset(); }
+    public Fit fit() { return fit; }
+    public void setFit(Fit fit) { this.fit = java.util.Objects.requireNonNull(fit); }
+    public void reset() {
+        partitions.clear();
         partitions.add(new Partition(0, USER_AREA_SIZE));
+        Arrays.fill(userArea, (byte) 0);
+        nextFitAddress = 0;
     }
-
-    public Fit fit() {
-        return fit;
-    }
-
-    public void setFit(Fit fit) {
-        this.fit = fit;
-    }
-
-    /**
-     * 申请内存。
-     *
-     * @param pid  进程标识
-     * @param size 需要的字节数
-     * @return 分配到的分区
-     * @throws IllegalStateException 空间不足（调用者据此把进程置为"无法载入内存"的等待状态）
-     */
     public Partition allocate(int pid, int size) {
-        if (size <= 0) {
-            throw new IllegalArgumentException("申请内存大小必须为正数，实际 " + size);
-        }
-        int idx = pick(size);
-        if (idx < 0) {
-            throw new IllegalStateException("内存不足：无法为 P" + pid + " 分配 " + size + " 字节");
-        }
-        Partition p = partitions.get(idx);
-        int remain = p.size - size;
-        p.pid = pid;
-        p.size = size;
-        if (remain > 0) {
-            partitions.add(idx + 1, new Partition(p.start + size, remain));
-        }
+        if (pid < 0 || size <= 0 || size > USER_AREA_SIZE) throw new IllegalArgumentException("程序大小必须为1~512字节");
+        if (partitionOf(pid) != null) throw new IllegalStateException("进程已有内存：" + pid);
+        Partition picked = null;
+        int start = -1;
         if (fit == Fit.NEXT) {
-            nextFitCursor = idx + 1;
+            for (Partition p : partitions) {
+                int candidate = Math.max(p.start, nextFitAddress);
+                if (p.isFree() && (long) candidate + size <= p.start + p.size) {
+                    picked = p; start = candidate; break;
+                }
+            }
         }
-        return p;
-    }
-
-    /** 按当前算法挑选可用分区下标，找不到返回 -1。 */
-    private int pick(int size) {
-        switch (fit) {
-            case FIRST:
-                for (int i = 0; i < partitions.size(); i++) {
-                    Partition p = partitions.get(i);
-                    if (p.isFree() && p.size >= size) {
-                        return i;
-                    }
+        if (picked == null) {
+            for (Partition p : partitions) {
+                if (p.isFree() && p.size >= size && (picked == null || fit == Fit.BEST && p.size < picked.size)) {
+                    picked = p; start = p.start;
+                    if (fit != Fit.BEST) break;
                 }
-                return -1;
-            case NEXT:
-                int n = partitions.size();
-                for (int k = 0; k < n; k++) {
-                    int i = (nextFitCursor + k) % n;
-                    Partition p = partitions.get(i);
-                    if (p.isFree() && p.size >= size) {
-                        return i;
-                    }
-                }
-                return -1;
-            case BEST:
-                int best = -1;
-                int bestSize = Integer.MAX_VALUE;
-                for (int i = 0; i < partitions.size(); i++) {
-                    Partition p = partitions.get(i);
-                    if (p.isFree() && p.size >= size && p.size < bestSize) {
-                        best = i;
-                        bestSize = p.size;
-                    }
-                }
-                return best;
-            default:
-                return -1;
+            }
         }
+        if (picked == null) throw new IllegalStateException("内存不足：无法为P" + pid + "分配" + size + "字节");
+        int index = partitions.indexOf(picked);
+        int end = picked.start + picked.size;
+        if (start > picked.start) {
+            partitions.add(index++, new Partition(picked.start, start - picked.start));
+        }
+        picked.start = start; picked.size = size; picked.pid = pid;
+        if (start + size < end) partitions.add(index + 1, new Partition(start + size, end - start - size));
+        nextFitAddress = (start + size) % USER_AREA_SIZE;
+        return picked;
     }
-
-    /** 回收某个进程占用的内存，并与相邻空闲分区合并。 */
+    public void load(int pid, byte[] image) {
+        Partition p = partitionOf(pid);
+        if (p == null || image.length != p.size) throw new IllegalArgumentException("程序与分区长度不一致");
+        System.arraycopy(image, 0, userArea, p.start, image.length);
+    }
+    public int readByte(int pid, int logicalAddress) {
+        Partition p = partitionOf(pid);
+        if (p == null || logicalAddress < 0 || logicalAddress >= p.size)
+            throw new IllegalStateException("存储保护：P" + pid + "取指越界，PC=" + logicalAddress);
+        return userArea[p.start + logicalAddress] & 255;
+    }
     public void free(int pid) {
         for (Partition p : partitions) {
             if (p.pid == pid) {
+                Arrays.fill(userArea, p.start, p.start + p.size, (byte) 0);
                 p.pid = -1;
             }
         }
-        merge();
-    }
-
-    /** 合并相邻空闲分区。 */
-    private void merge() {
-        for (int i = 0; i < partitions.size() - 1; ) {
-            Partition a = partitions.get(i);
-            Partition b = partitions.get(i + 1);
-            if (a.isFree() && b.isFree() && a.end() + 1 == b.start) {
-                a.size += b.size;
-                partitions.remove(i + 1);
-            } else {
-                i++;
-            }
+        var iterator = partitions.listIterator();
+        Partition previous = null;
+        while (iterator.hasNext()) {
+            Partition current = iterator.next();
+            if (previous != null && previous.isFree() && current.isFree()) {
+                previous.size += current.size;
+                iterator.remove();
+            } else previous = current;
         }
     }
-
-    /** 存储保护：校验某进程访问的地址范围是否落在它自己的分区内。 */
     public boolean checkAccess(int pid, int address, int length) {
         Partition p = partitionOf(pid);
-        if (p == null) {
-            return false;
-        }
-        return address >= p.start && address + length - 1 <= p.end();
+        return p != null && length > 0 && address >= p.start && (long) address + length <= p.start + p.size;
     }
-
     public Partition partitionOf(int pid) {
-        for (Partition p : partitions) {
-            if (p.pid == pid) {
-                return p;
-            }
-        }
+        for (Partition p : partitions) if (p.pid == pid) return p;
         return null;
     }
-
     public List<Partition> partitions() {
-        return new ArrayList<>(partitions);
-    }
-
-    /** 空闲字节总量。 */
-    public int freeBytes() {
-        int n = 0;
+        List<Partition> copy = new ArrayList<>();
         for (Partition p : partitions) {
-            if (p.isFree()) {
-                n += p.size;
-            }
+            Partition c = new Partition(p.start, p.size); c.pid = p.pid; copy.add(c);
         }
-        return n;
+        return copy;
     }
-
-    /** 已分配字节总量。 */
-    public int usedBytes() {
-        return USER_AREA_SIZE - freeBytes();
+    public int freeBytes() {
+        int total = 0;
+        for (Partition p : partitions) if (p.isFree()) total += p.size;
+        return total;
     }
-
-    /**
-     * 按字节导出占用者映射：{@code owners[i]} 表示第 i 个字节属于哪个进程，-1 为空闲。
-     * 界面直接用它画彩色内存条。
-     */
+    public int usedBytes() { return USER_AREA_SIZE - freeBytes(); }
     public int[] ownerMap() {
         int[] map = new int[USER_AREA_SIZE];
-        java.util.Arrays.fill(map, -1);
-        for (Partition p : partitions) {
-            if (p.isFree()) {
-                continue;
-            }
-            for (int i = p.start; i <= p.end() && i < USER_AREA_SIZE; i++) {
-                map[i] = p.pid;
-            }
-        }
+        Arrays.fill(map, -1);
+        for (Partition p : partitions) if (!p.isFree()) Arrays.fill(map, p.start, p.start + p.size, p.pid);
         return map;
     }
 }

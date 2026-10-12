@@ -27,10 +27,10 @@ import java.util.Random;
  * <h2>并发模型</h2>
  * <p>指导书提示"可能需要多线程编程"才能保证 CPU 执行、系统时钟递增、时间片递减、
  * 设备倒计时递减、随机新进程诞生这几种任务同时存在。本原型把它们放在<b>同一个时间脉冲</b>里，
- * 由 {@link CPU#CPU(long)} 所在的线程驱动，脉冲内部按固定顺序推进：</p>
+ * 由 {@link CPU#CPU()} 所在的线程驱动，脉冲内部按固定顺序推进：</p>
  * <pre>
- *   ① 随机新进程诞生   ② 中断检查与处理   ③ 解释执行一条指令
- *   ④ 设备倒计时递减    ⑤ 系统时钟递增 + 时间片递减
+ *   ① 已有设备倒计时   ② 中断检查与处理   ③ 随机到达和调度
+ *   ④ 执行一条指令并结算实际执行者    ⑤ 系统时钟递增
  * </pre>
  * <p>整个脉冲持有唯一的模拟锁 {@link #lock()}，因此界面读取快照、用户命令修改磁盘时
  * 都不会读到"半个操作"。这既满足并发语义，又保证演示结果可复现。</p>
@@ -47,14 +47,18 @@ public class Kernel implements CPU.Host {
     private final Random random = new Random(20260501L);
 
     /** 运行日志（进程创建、调度、设备分配、命令执行……）。 */
-    private final Deque<String> log = new ArrayDeque<>();
+    public record LogEntry(long sequence, String text) { }
+    private final Deque<LogEntry> log = new ArrayDeque<>();
+    private long logSequence;
+    private long cachedFsRevision = -1;
+    private FileSystem.DirNode cachedRoot;
+    private List<String> cachedExecutables = List.of();
     private static final int LOG_LIMIT = 400;
 
     /** 系统时钟：开机以来的时间单位数。 */
     private int systemClock;
-    /** 新进程运行的周期：每 N 个时间单位允许诞生一个新进程。 */
-    private int arrivePeriod = 4;
-    private int arriveCountdown = 4;
+    private int arriveCountdown;
+    private boolean autoArrivals = true;
 
     /** 系统区与用户区的划分（指导书：系统区放 PCB 与内存分配表，用户区放可执行文件）。 */
     public static final int PCB_AREA_CAPACITY = Scheduler.MAX_PROCESS;
@@ -99,52 +103,61 @@ public class Kernel implements CPU.Host {
     }
 
     public List<String> logLines(int max) {
-        List<String> all = new ArrayList<>(log);
-        int from = Math.max(0, all.size() - max);
-        return all.subList(from, all.size());
-    }
-
-    @Override
-    public void log(String message) {
-        String line = String.format("[t=%04d] %s", systemClock, message);
-        log.addLast(line);
-        while (log.size() > LOG_LIMIT) {
-            log.removeFirst();
+        synchronized (lock) {
+            return log.stream().skip(Math.max(0, log.size() - max)).map(LogEntry::text).toList();
         }
+    }
+    public List<LogEntry> logEntriesAfter(long sequence) {
+        synchronized (lock) { return log.stream().filter(e -> e.sequence() > sequence).toList(); }
+    }
+    public void log(String message) {
+        synchronized (lock) {
+            log.addLast(new LogEntry(++logSequence, String.format("[t=%04d] %s", systemClock, message)));
+            while (log.size() > LOG_LIMIT) log.removeFirst();
+        }
+    }
+    public void setAutoArrivals(boolean enabled) {
+        synchronized (lock) { autoArrivals = enabled; }
+    }
+    public boolean autoArrivalsEnabled() {
+        synchronized (lock) { return autoArrivals; }
+    }
+    public void setMemoryFit(MemoryManager.Fit fit) {
+        synchronized (lock) { memory.setFit(fit); }
     }
 
     // ==================================================================
     // 初始化
     // ==================================================================
 
-    /** 格式化磁盘并建立演示用的初始目录/文件（≥5 个目录、≥15 个文件、10 个可执行文件）。 */
+    /** 正常启动加载已有磁盘；仅首次启动建立演示数据。 */
+    public void boot(int seed) {
+        synchronized (lock) {
+            if (disk.exists()) fs.load();
+            else { fs.format(); SeedBuilder.build(fs); }
+            resetRuntime(seed);
+        }
+    }
+    /** 用户显式重新初始化/格式化时重建演示数据。 */
     public void initialize(int seed) {
         synchronized (lock) {
-            random.setSeed(seed);
             fs.format();
             SeedBuilder.build(fs);
-            systemClock = 0;
-            arriveCountdown = arrivePeriod;
-            pcbFullNoted = false;
-            results.clear();
-            log.clear();
-            for (PCB p : scheduler.pcbs()) {
-                if (p.pid == Scheduler.IDLE_PID) {
-                    continue;
-                }
-                int keep = p.pid;
-                p.reset();
-                // reset() 会把 pid 清成 -1，必须还原为数组下标，否则 PCB 池不可用
-                p.pid = keep;
-                p.state = ProcessState.FREE;
-            }
-            setupIdleProcess();
-            for (var d : devices.devices()) {
-                d.owner = -1;
-                d.remaining = 0;
-            }
-            log("系统初始化完成；" + DiskLayout.describe());
+            resetRuntime(seed);
         }
+    }
+    private void resetRuntime(int seed) {
+        random.setSeed(seed);
+        scheduler.reset(); memory.reset(); devices.reset(); cpu.reset();
+        systemClock = 0;
+        arriveCountdown = 2 + random.nextInt(5);
+        pcbFullNoted = false;
+        results.clear(); log.clear();
+        setupIdleProcess();
+        scheduler.setRunningPid(Scheduler.IDLE_PID);
+        scheduler.pcb(Scheduler.IDLE_PID).state = ProcessState.RUNNING;
+        cpu.restoreContext(scheduler.pcb(Scheduler.IDLE_PID));
+        log("系统初始化完成；" + DiskLayout.describe());
     }
 
     /**
@@ -173,6 +186,9 @@ public class Kernel implements CPU.Host {
 
     /** 调整"时间单位"的实际长度（毫秒）。 */
     public void setPulseMillis(long ms) {
+        synchronized (lock) { setPulseMillisLocked(ms); }
+    }
+    private void setPulseMillisLocked(long ms) {
         long v = Math.max(20, ms);
         if (v == pulseMillis) {
             return;   // 值没变就不改，也不刷日志
@@ -196,10 +212,10 @@ public class Kernel implements CPU.Host {
 
     @Override
     public int onArrive() {
-        if (--arriveCountdown > 0) {
+        if (!autoArrivals || --arriveCountdown > 0) {
             return -1;
         }
-        arriveCountdown = arrivePeriod;
+        arriveCountdown = 2 + random.nextInt(5);
         List<String> candidates = executableFiles();
         if (candidates.isEmpty()) {
             return -1;
@@ -226,6 +242,9 @@ public class Kernel implements CPU.Host {
 
     @Override
     public void onTimeSliceExpired() {
+        synchronized (lock) { onTimeSliceExpiredLocked(); }
+    }
+    private void onTimeSliceExpiredLocked() {
         PCB p = scheduler.running();
         if (p != null && p.pid != Scheduler.IDLE_PID) {
             log("时间片到：保存 P" + p.pid + " 现场(PC=" + p.pc + ", x=" + p.ax + ")，转入就绪队列");
@@ -239,20 +258,30 @@ public class Kernel implements CPU.Host {
 
     @Override
     public void onIoComplete(List<DeviceManager.Device> finishedDevices) {
-        for (DeviceManager.Device d : finishedDevices) {
-            int owner = d.owner;
-            log("I/O 中断：设备 " + d.name() + " 使用完毕，唤醒 P" + owner);
-            int next = devices.release(d);
-            if (next >= 0) {
-                log("设备 " + d.type + " 移交给等待队列队首 P" + next + "（置就绪）");
-                scheduler.removeBlocked(next);
-                scheduler.enqueueReady(next);
+        synchronized (lock) {
+            for (DeviceManager.Device d : finishedDevices) {
+                int owner = d.owner;
+                int next = devices.release(d);
+                PCB completed = scheduler.pcb(owner);
+                if (completed != null) completed.waitingDevice = -1;
+                awake(owner);
+                log("I/O 中断：设备" + d.name() + "完成，唤醒P" + owner);
+                noteDeviceHandoff(d, next);
             }
         }
+    }
+    private void noteDeviceHandoff(DeviceManager.Device d, int next) {
+        if (next < 0) return;
+        PCB waiting = scheduler.pcb(next);
+        waiting.waitingDevice = d.index;
+        log("设备" + d.name() + "分配给等待者P" + next + "，继续阻塞直至I/O完成");
     }
 
     @Override
     public void onProgramEnd(PCB p) {
+        synchronized (lock) { onProgramEndLocked(p); }
+    }
+    private void onProgramEndLocked(PCB p) {
         if (p == null) {
             return;
         }
@@ -267,26 +296,41 @@ public class Kernel implements CPU.Host {
 
     @Override
     public void onIllegalInstruction(PCB p, int opcode) {
-        log("非法指令：P" + p.pid + " 在偏移 " + p.pc + " 遇到 0x" + String.format("%02X", opcode) + "，撤销该进程");
-        results.addFirst(String.format("P%d(%s) 因非法指令 0x%02X 被撤销", p.pid, p.name, opcode));
+        log("非法指令：P" + p.pid + "遇到0x" + String.format("%02X", opcode));
+    }
+    @Override
+    public void onProcessFault(PCB p, String reason) {
+        synchronized (lock) { onProcessFaultLocked(p, reason); }
+    }
+    private void onProcessFaultLocked(PCB p, String reason) {
+        log("异常结束：P" + p.pid + " " + reason);
+        results.addFirst("P" + p.pid + "(" + p.name + ")异常结束：" + reason);
+        while (results.size() > 12) results.removeLast();
+        destroy(p.pid);
     }
 
     @Override
     public void onDeviceBlocked(PCB p, String deviceType, int duration) {
+        DeviceManager.Device d = devices.deviceOf(p.pid);
+        p.waitingDevice = d == null ? -1 : d.index;
         block(p.pid, BlockReason.DEVICE);
     }
 
     @Override
     public int onSchedule() {
+        synchronized (lock) { return onScheduleLocked(); }
+    }
+    private int onScheduleLocked() {
         // 上一个进程不再占用处理器：把它从"运行"状态摘下来
         // （闲逛进程被抢占时必须改回就绪，否则界面会一直显示它在运行）
         PCB prev = scheduler.running();
         if (prev != null) {
+            cpu.saveContext(prev);
             if (prev.pid == Scheduler.IDLE_PID) {
                 prev.state = ProcessState.READY;
                 prev.blockReason = BlockReason.IDLE;
             } else if (prev.state == ProcessState.RUNNING) {
-                prev.state = ProcessState.READY;
+                scheduler.enqueueReady(prev.pid);
             }
         }
         scheduler.setRunningPid(-1);
@@ -302,6 +346,7 @@ public class Kernel implements CPU.Host {
             idle.state = ProcessState.RUNNING;
             idle.blockReason = BlockReason.IDLE;
             scheduler.setRunningPid(Scheduler.IDLE_PID);
+            cpu.restoreContext(idle);
             return Scheduler.IDLE_PID;
         }
         return run(pid);
@@ -313,13 +358,11 @@ public class Kernel implements CPU.Host {
         if (p == null) {
             return -1;
         }
-        // 恢复现场：把 PCB 中记录的寄存器内容恢复进 CPU（本实现中 CPU 寄存器即 PCB 字段）
         p.state = ProcessState.RUNNING;
         p.blockReason = BlockReason.NONE;
-        if (p.timeSliceLeft <= 0) {
-            p.timeSliceLeft = Scheduler.TIME_SLICE;
-        }
+        p.timeSliceLeft = Scheduler.TIME_SLICE;
         scheduler.setRunningPid(pid);
+        cpu.restoreContext(p);
         return pid;
     }
 
@@ -372,50 +415,41 @@ public class Kernel implements CPU.Host {
      * @return 新进程 pid；失败返回 -1
      */
     public int create(String programPath) {
-        PCB p = scheduler.allocatePcb();
-        if (p == null) {
-            log("进程创建失败：PCB 已满（最多 " + Scheduler.MAX_PROCESS + " 个）");
-            return -1;
+        synchronized (lock) {
+            FileEntry e = fs.resolve(programPath);
+            if (e == null || !e.isExecutable()) {
+                log("进程创建失败：需要.e可执行文件 " + programPath); return -1;
+            }
+            byte[] image = fs.readAll(e);
+            if (image.length == 0 || image.length > MemoryManager.USER_AREA_SIZE) {
+                log("进程创建失败：程序大小必须为1~512字节"); return -1;
+            }
+            PCB p = scheduler.allocatePcb();
+            if (p == null) { log("进程创建失败：PCB已满"); return -1; }
+            try {
+                p.name = e.displayName();
+                p.programPath = FileSystem.normalize(programPath);
+                p.memSize = image.length;
+                p.timeSliceLeft = Scheduler.TIME_SLICE;
+                try {
+                    MemoryManager.Partition part = memory.allocate(p.pid, image.length);
+                    p.memBase = part.start;
+                } catch (IllegalStateException noMemory) {
+                    p.image = image; // 仅未装入的程序保留暂存副本。
+                    p.blockedSince = systemClock;
+                    scheduler.enqueueBlocked(p.pid, BlockReason.MEMORY);
+                    log("P" + p.pid + "等待内存，需求" + image.length + "字节");
+                    return p.pid;
+                }
+                memory.load(p.pid, image);
+                p.image = new byte[0];
+                scheduler.enqueueReady(p.pid);
+                log("创建进程P" + p.pid + "（" + p.name + "，" + image.length + "字节），挂入就绪队列");
+                return p.pid;
+            } catch (RuntimeException failure) {
+                memory.free(p.pid); scheduler.freePcb(p.pid); throw failure;
+            }
         }
-        FileEntry e = fs.resolve(programPath);
-        if (e == null || e.isDirectory()) {
-            log("进程创建失败：可执行文件不存在 " + programPath);
-            scheduler.freePcb(p.pid);
-            return -1;
-        }
-        byte[] image = fs.readAll(e);
-        // 申请主存空间；容量不足则进程"无法载入内存"而等待
-        try {
-            MemoryManager.Partition part = memory.allocate(p.pid, image.length);
-            p.memBase = part.start;
-            p.memSize = part.size;
-        } catch (IllegalStateException ex) {
-            scheduler.enqueueBlocked(p.pid, BlockReason.MEMORY);
-            p.name = e.displayName();
-            p.programPath = FileSystem.normalize(programPath);
-            p.image = image;
-            p.memSize = image.length;
-            log("创建进程 P" + p.pid + "（" + e.displayName() + "，" + image.length
-                    + " 字节）失败：内存不足，进程转入等待内存");
-            results.addFirst(String.format("P%d(%s) 因内存不足无法载入，进入等待", p.pid, e.displayName()));
-            return p.pid;
-        }
-        // 初始化 PCB
-        p.name = e.displayName();
-        p.programPath = FileSystem.normalize(programPath);
-        p.image = image;
-        p.pc = 0;
-        p.ax = 0;
-        p.psw = 0;
-        p.ir = 0;
-        p.timeSliceLeft = Scheduler.TIME_SLICE;
-        p.state = ProcessState.READY;
-        p.blockReason = BlockReason.NONE;
-        // 挂入就绪队列
-        scheduler.enqueueReady(p.pid);
-        log(String.format("创建进程 P%d（%s，%d 字节，装入内存 [%d..%d]），挂入就绪队列",
-                p.pid, e.displayName(), image.length, p.memBase, p.memBase + p.memSize - 1));
-        return p.pid;
     }
 
     /**
@@ -423,6 +457,9 @@ public class Kernel implements CPU.Host {
      * <p>三步：回收进程所占内存 → 回收进程控制块 → 在屏幕上显示进程执行结果。</p>
      */
     public void destroy(int pid) {
+        synchronized (lock) { destroyLocked(pid); }
+    }
+    private void destroyLocked(int pid) {
         if (pid == Scheduler.IDLE_PID) {
             return;
         }
@@ -434,8 +471,8 @@ public class Kernel implements CPU.Host {
         devices.removeFromAllQueues(pid);
         DeviceManager.Device d = devices.deviceOf(pid);
         if (d != null) {
-            d.owner = -1;
-            d.remaining = 0;
+            int next = devices.release(d);
+            noteDeviceHandoff(d, next);
         }
         log("撤销进程 P" + pid + "：回收内存并归还 PCB");
         boolean wasRunning = scheduler.runningPid() == pid;
@@ -452,6 +489,9 @@ public class Kernel implements CPU.Host {
      * <p>三步：保存运行进程的 CPU 现场 → 修改进程状态 → 链入对应阻塞队列，然后转向进程调度。</p>
      */
     public void block(int pid, BlockReason reason) {
+        synchronized (lock) { blockLocked(pid, reason); }
+    }
+    private void blockLocked(int pid, BlockReason reason) {
         PCB p = scheduler.pcb(pid);
         if (p == null || p.state == ProcessState.FREE) {
             return;
@@ -459,8 +499,10 @@ public class Kernel implements CPU.Host {
         // 进程主动阻塞时，本次调度已经由本原语自己完成，清除"时间片到"中断位，
         // 避免进程被唤醒后立刻又触发一次多余的调度。
         p.psw = cn.edu.scau.os.cpu.InterruptPSW.clear(p.psw, cn.edu.scau.os.cpu.InterruptPSW.BIT_SCHEDULE);
-        // 保存现场（本实现中 CPU 寄存器即 PCB 字段，此处显式落一次日志以示语义）
+        if (scheduler.runningPid() == pid) cpu.saveContext(p);
+        // 保存现场后转入阻塞队列。
         p.state = ProcessState.BLOCKED;
+        p.blockedSince = systemClock;
         p.blockReason = reason;
         scheduler.enqueueBlocked(pid, reason);
         if (scheduler.runningPid() == pid) {
@@ -476,6 +518,9 @@ public class Kernel implements CPU.Host {
      * 进程唤醒原语：把进程由阻塞队列中摘下，修改状态为就绪，然后链入就绪队列。
      */
     public void awake(int pid) {
+        synchronized (lock) { awakeLocked(pid); }
+    }
+    private void awakeLocked(int pid) {
         PCB p = scheduler.pcb(pid);
         if (p == null || p.state != ProcessState.BLOCKED) {
             return;
@@ -483,16 +528,22 @@ public class Kernel implements CPU.Host {
         scheduler.removeBlocked(pid);
         p.blockReason = BlockReason.NONE;
         scheduler.enqueueReady(pid);
+        p.blockedSince = -1;
         log("唤醒 P" + pid + "：置为就绪并链入就绪队列");
     }
 
     /** 检查是否能把"等待内存"的进程装入内存（内存回收后调用）。 */
     public void retryMemoryWaiters() {
+        synchronized (lock) { retryMemoryWaitersLocked(); }
+    }
+    private void retryMemoryWaitersLocked() {
         for (PCB p : scheduler.pcbs()) {
             if (p.state == ProcessState.BLOCKED && p.blockReason == BlockReason.MEMORY) {
                 try {
                     MemoryManager.Partition part = memory.allocate(p.pid, p.memSize);
                     p.memBase = part.start;
+                    memory.load(p.pid, p.image);
+                    p.image = new byte[0];
                     p.pc = 0;
                     p.timeSliceLeft = Scheduler.TIME_SLICE;
                     awake(p.pid);
@@ -510,24 +561,36 @@ public class Kernel implements CPU.Host {
 
     /** 递归收集全部可执行文件（扩展名为 e）。 */
     public List<String> executableFiles() {
-        List<String> out = new ArrayList<>();
-        collectExecutables(DiskLayout.ROOT_BLOCK, "", out);
-        return out;
+        synchronized (lock) {
+            refreshFileCache();
+            return new ArrayList<>(cachedExecutables);
+        }
     }
 
-    private void collectExecutables(int dirBlock, String prefix, List<String> out) {
-        for (FileEntry e : fs.list(dirBlock)) {
-            String path = prefix + "/" + e.name() + (e.extension().isEmpty() ? "" : "." + e.extension());
-            if (e.isDirectory()) {
-                collectExecutables(e.startBlock(), path, out);
-            } else if (e.isExecutable()) {
-                out.add(path);
-            }
+    private void refreshFileCache() {
+        if (cachedFsRevision == fs.revisions()) return;
+        cachedRoot = fs.rootTree();
+        List<String> paths = new ArrayList<>();
+        collectCachedExecutables(cachedRoot, "", paths);
+        cachedExecutables = List.copyOf(paths);
+        cachedFsRevision = fs.revisions();
+    }
+    private void collectCachedExecutables(FileSystem.DirNode node, String prefix, List<String> paths) {
+        for (FileSystem.DirNode child : node.children()) {
+            String path = prefix + "/" + child.name();
+            if (child.directory()) collectCachedExecutables(child, path, paths);
+            else if (child.name().toLowerCase(java.util.Locale.ROOT).endsWith(".e")) paths.add(path);
         }
     }
 
     /** 把源文本汇编后写入可执行文件（界面"编译并保存"用）。 */
     public Assembler.Result assembleAndSave(String path, String source) {
+        synchronized (lock) { return assembleAndSaveLocked(path, source); }
+    }
+    private Assembler.Result assembleAndSaveLocked(String path, String source) {
+        path = FileSystem.normalize(path);
+        if (!DiskLayout.EXT_EXECUTABLE.equalsIgnoreCase(FileSystem.extensionOf(path)))
+            throw new IllegalArgumentException("汇编程序必须保存为.e文件");
         FileSystem.checkName(FileSystem.baseName(path), FileSystem.extensionOf(path));
         Assembler.Result r = Assembler.assemble(source);
         if (!r.ok()) {
@@ -571,7 +634,7 @@ public class Kernel implements CPU.Host {
 
     public record PcbView(int pid, String name, String state, String blockReason, int ax, int pc,
                           int timeSliceLeft, int memBase, int memSize, String programPath,
-                          int psw, String device) {
+                          int psw, String device, int blockedSince) {
     }
 
     public record DevView(String name, String type, int index, int owner, String ownerText, int remaining) {
@@ -593,7 +656,7 @@ public class Kernel implements CPU.Host {
                 DeviceManager.Device d = devices.deviceOf(p.pid);
                 pcbs.add(new PcbView(p.pid, p.name, p.state.text(), p.blockReason.text(),
                         p.ax, p.pc, p.timeSliceLeft, p.memBase, p.memSize, p.programPath,
-                        p.psw, d == null ? "—" : d.name()));
+                        p.psw, d == null ? "—" : d.name(), p.blockedSince));
             }
 
             List<DevView> dv = new ArrayList<>();
@@ -614,9 +677,8 @@ public class Kernel implements CPU.Host {
                 dwv.add(new DevWaitView(type, dt.size(), busy, devices.waitQueue(type)));
             }
 
-            List<FileSystem.DirNode> tree = new ArrayList<>();
-            FileSystem.DirNode root = fs.rootTree();
-            tree.add(root);
+            refreshFileCache();
+            List<FileSystem.DirNode> tree = cachedRoot.children();
 
             int[] owners = memory.ownerMap();
             PCB run = scheduler.running();
@@ -664,6 +726,12 @@ public class Kernel implements CPU.Host {
             String cmd = tok[0].toLowerCase();
             try {
                 switch (cmd) {
+                    case "run": {
+                        requireArgs(tok, 2, "run <可执行文件路径>");
+                        int pid = create(FileSystem.normalize(tok[1]));
+                        return new CommandResult(pid >= 0, pid < 0 ? "无法创建进程，请检查文件与PCB容量"
+                                : "已创建进程P" + pid + "，状态：" + scheduler.pcb(pid).state.text());
+                    }
                     case "create": {
                         requireArgs(tok, 2, "create <路径> [文本内容]");
                         String path = FileSystem.normalize(tok[1]);
@@ -677,8 +745,9 @@ public class Kernel implements CPU.Host {
                             }
                             sb.append(i > 2 ? " " : "").append(t);
                         }
-                        String text = sb.toString().replace("|", "\n");
-                        byte[] content = text.isEmpty() ? new byte[0] : text.getBytes(StandardCharsets.US_ASCII);
+                        String text = sb.toString();
+                        if (DiskLayout.EXT_EXECUTABLE.equalsIgnoreCase(FileSystem.extensionOf(path))) text = text.replace("|", "\n");
+                        byte[] content = text.isEmpty() ? new byte[0] : text.getBytes(StandardCharsets.UTF_8);
                         if (DiskLayout.EXT_EXECUTABLE.equalsIgnoreCase(FileSystem.extensionOf(path))) {
                             // .e 文件按源码汇编后写入
                             Assembler.Result r = Assembler.assemble(text);
@@ -710,7 +779,7 @@ public class Kernel implements CPU.Host {
                         if (e.isExecutable()) {
                             return new CommandResult(true, "反汇编 " + path + "：\n" + Assembler.disassemble(data));
                         }
-                        return new CommandResult(true, "内容 " + path + "：\n" + new String(data, StandardCharsets.US_ASCII));
+                        return new CommandResult(true, "内容 " + path + "：\n" + new String(data, StandardCharsets.UTF_8));
                     }
                     case "copy": {
                         requireArgs(tok, 3, "copy <源路径> <目标路径>");
@@ -752,7 +821,8 @@ public class Kernel implements CPU.Host {
                         int attr = switch (tok[2]) {
                             case "只读", "readonly", "ro" -> DiskLayout.ATTR_READONLY;
                             case "系统", "system" -> DiskLayout.ATTR_SYSTEM;
-                            default -> DiskLayout.ATTR_NORMAL;
+                            case "普通", "normal" -> DiskLayout.ATTR_NORMAL;
+                            default -> throw new IllegalArgumentException("未知属性：" + tok[2]);
                         };
                         fs.changeAttributes(path, attr);
                         return new CommandResult(true, "已修改属性 " + path);
@@ -804,6 +874,7 @@ public class Kernel implements CPU.Host {
                   mkdir  <路径>               建立目录（无扩展名）
                   rmdir  <路径>               删除空目录（非空报错）
                 可选命令：
+                  run <路径>                  创建进程运行.e文件
                   deldir <路径>               删除目录（含内容）
                   change <路径> <属性>        修改属性（普通/只读/系统）
                   dir                         显示目录树

@@ -69,6 +69,11 @@ public record FileEntry(int nameOffsetInBlock,
 
     /** 打包成 8 字节。 */
     public static byte[] pack(String name, String extension, int attributes, int startBlock, int length) {
+        FileSystem.checkName(name, extension);
+        if (startBlock < 0 || startBlock >= VirtualDisk.BLOCK_COUNT || length < 0 || length > 65535)
+            throw new IllegalArgumentException("目录项起始块或长度越界");
+        if ((attributes & DiskLayout.ATTR_DIRECTORY) != 0 && extension != null && !extension.isEmpty())
+            throw new IllegalArgumentException("目录没有扩展名");
         byte[] b = new byte[DiskLayout.ENTRY_SIZE];
         putPadded(b, 0, DiskLayout.NAME_LEN, name);
         putPadded(b, DiskLayout.NAME_LEN, DiskLayout.EXT_LEN, extension);

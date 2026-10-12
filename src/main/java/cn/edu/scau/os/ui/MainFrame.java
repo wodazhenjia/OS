@@ -107,8 +107,8 @@ public class MainFrame extends JFrame {
         // 按屏幕自适应：保证图 1 的四列布局在小屏上也能完整显示
         java.awt.Rectangle screen = java.awt.GraphicsEnvironment.getLocalGraphicsEnvironment()
                 .getMaximumWindowBounds();
-        int w = Math.max(1100, Math.min(1800, (int) (screen.width * 0.97)));
-        int h = Math.max(700, Math.min(1040, (int) (screen.height * 0.95)));
+        int w = Math.min(screen.width, Math.max(900, Math.min(1800, (int) (screen.width * 0.97))));
+        int h = Math.min(screen.height, Math.max(650, Math.min(1040, (int) (screen.height * 0.95))));
         setSize(w, h);
         setLocation(screen.x + (screen.width - w) / 2, screen.y + Math.max(0, (screen.height - h) / 2));
         setLayout(new BorderLayout(6, 6));
@@ -120,6 +120,13 @@ public class MainFrame extends JFrame {
         // 界面刷新：每 200ms 取一次快照重画
         refreshTimer = new Timer(200, e -> refresh());
         refreshTimer.start();
+        addWindowListener(new java.awt.event.WindowAdapter() {
+            @Override
+            public void windowClosed(java.awt.event.WindowEvent e) {
+                refreshTimer.stop();
+                kernel.shutdown();
+            }
+        });
 
         appendLog(Kernel.helpText());
         appendLog("提示：修改 disk 文件前请先暂停；点击“暂停”可冻结模拟以便观察。");
@@ -166,18 +173,13 @@ public class MainFrame extends JFrame {
         });
         JMenuItem step = new JMenuItem("单步执行一个时间单位");
         step.addActionListener(e -> {
-            boolean was = kernel.cpu().isPaused();
-            kernel.cpu().setPaused(true);
-            synchronized (kernel.lock()) {
-                kernel.cpu().cycle();
-            }
-            kernel.cpu().setPaused(was);
+            kernel.cpu().step();
             refresh();
         });
         JMenuItem editor = new JMenuItem("汇编编辑器（写源码 → 编译 → 保存为 .e）");
         editor.addActionListener(e -> {
             appendLog("打开汇编编辑器：源码按行编写，// 或 # 之后为注释；"
-                    + "保存后可用 create 命令创建进程运行。");
+                    + "保存后可用 run 命令创建进程运行。");
             AsmEditorDialog dialog = new AsmEditorDialog(this, kernel);
             dialog.addWindowListener(new java.awt.event.WindowAdapter() {
                 @Override
@@ -203,6 +205,9 @@ public class MainFrame extends JFrame {
         sim.add(pause);
         sim.add(step);
         sim.add(rate);
+        javax.swing.JCheckBoxMenuItem arrivals = new javax.swing.JCheckBoxMenuItem("自动随机创建进程", kernel.autoArrivalsEnabled());
+        arrivals.addActionListener(e -> kernel.setAutoArrivals(arrivals.isSelected()));
+        sim.add(arrivals);
         sim.addSeparator();
         sim.add(editor);
         sim.addSeparator();
@@ -218,7 +223,7 @@ public class MainFrame extends JFrame {
                 case BEST -> "最佳适配 (Best Fit)";
             });
             it.addActionListener(e -> {
-                kernel.memory().setFit(f);
+                kernel.setMemoryFit(f);
                 appendLog("存储管理算法切换为：" + it.getText());
             });
             fit.add(it);
@@ -231,11 +236,11 @@ public class MainFrame extends JFrame {
         about.addActionListener(e -> JOptionPane.showMessageDialog(this,
                 "SimOS —— 《操作系统分析与设计实习》题目六 模拟操作系统实现（原型）\n\n"
                         + "指令集（每条指令 1 字节）：\n"
-                        + "  0x00-0x3F  x=?   赋值，立即数 0~63\n"
-                        + "  0x40       x++   x 加 1\n"
-                        + "  0x41       x--   x 减 1\n"
-                        + "  0x42-0x44  !A?/!B?/!C?  申请设备，后跟 1 字节使用时间\n"
-                        + "  0x45       end   结束\n\n"
+                        + "  0x00-0x63  x=?   赋值，立即数 0~99\n"
+                        + "  0x64       x++   x 加 1\n"
+                        + "  0x65       x--   x 减 1\n"
+                        + "  0x80-0x89 / 0x90-0x99 / 0xA0-0xA9  A/B/C设备，低位时间0~9\n"
+                        + "  0x66       end   结束\n\n"
                         + DiskLayout.describe() + "\n\n"
                         + "说明：指导书要求“FAT 占第 0、1 块”与“FAT 有 256 项（每项 1 字节）”"
                         + "无法同时成立；本项目保留 256 项 FAT，因此 FAT 占 0~3 块、根目录移到第 4 块。",
@@ -263,9 +268,9 @@ public class MainFrame extends JFrame {
 
         row(top, c, 0,
                 tile("系统时钟", clockValue),
-                tile("正在运行进程 ID / CPU", runningValue),
+                tile("运行进程 / CPU", runningValue),
                 tile("时间片", sliceValue),
-                wideTile("用户命令接口（在下方输入框键入命令）", new JLabel("create / delete / type / copy / mkdir / rmdir …")));
+                wideTile("用户命令接口", new JLabel("在下方输入 create / type / run 等命令")));
 
         row(top, c, 1,
                 textTile("就绪队列进程 ID", readyArea),
@@ -273,21 +278,24 @@ public class MainFrame extends JFrame {
                 textTile("执行进程中间结果", resultArea),
                 treeTile("磁盘目录结构", dirTree));
 
-        memPanel.setBorder(titled("主存用户区使用情况（512 字节，彩色分块）"));
-        diskPanel.setBorder(titled("磁盘使用情况（256 盘块，16×16）"));
+        memPanel.setBorder(titled("用户内存（512字节）"));
+        diskPanel.setBorder(titled("磁盘使用情况（256块，16×16）"));
         row(top, c, 2,
-                textTile("正在执行的指令", instrArea),
+                textTile("最近执行的指令", instrArea),
                 textTile("进程执行完，显示结果", resultAreaAlt()),
                 memPanel,
                 diskPanel);
 
         row(top, c, 3,
-                textTile("设备使用情况：是否分配、占用进程、等待进程", deviceArea),
+                textTile("设备状态 / 等待队列", deviceArea),
                 textTile("内存分配表 / 磁盘摘要", memText),
                 textTile("PCB 区（最多 10 个）", pcbArea),
                 textTile("磁盘与 FAT 摘要", diskText));
 
-        root.add(top, BorderLayout.CENTER);
+        top.setPreferredSize(new Dimension(1100, 502));
+        JScrollPane scroll = new JScrollPane(top);
+        scroll.getVerticalScrollBar().setUnitIncrement(24);
+        root.add(scroll, BorderLayout.CENTER);
         return root;
     }
 
@@ -309,12 +317,7 @@ public class MainFrame extends JFrame {
         run.addActionListener(e -> runCommand());
         cmdField.addActionListener(e -> runCommand());
         step.addActionListener(e -> {
-            boolean was = kernel.cpu().isPaused();
-            kernel.cpu().setPaused(true);
-            synchronized (kernel.lock()) {
-                kernel.cpu().cycle();
-            }
-            kernel.cpu().setPaused(was);
+            kernel.cpu().step();
             refresh();
         });
         pause.addActionListener(e -> {
@@ -333,6 +336,7 @@ public class MainFrame extends JFrame {
 
         JPanel speed = new JPanel(new BorderLayout(6, 0));
         JLabel speedCaption = new JLabel("时间单位长度：");
+        speedValue.setPreferredSize(new Dimension(255, 30));
         speedSlider = new JSlider(MIN_PULSE_MS, MAX_PULSE_MS,
                 (int) Math.max(MIN_PULSE_MS, Math.min(MAX_PULSE_MS, kernel.pulseMillis())));
         // 反过来放：向左 = 更长 = 更慢，向右 = 更短 = 更快
@@ -369,7 +373,7 @@ public class MainFrame extends JFrame {
 
         JScrollPane logScroll = new JScrollPane(cmdLog);
         logScroll.setBorder(titled("运行日志（命令结果 + 内核事件）"));
-        logScroll.setPreferredSize(new Dimension(1100, 190));
+        logScroll.setPreferredSize(new Dimension(900, 80));
 
         south.add(north, BorderLayout.NORTH);
         south.add(logScroll, BorderLayout.CENTER);
@@ -378,9 +382,11 @@ public class MainFrame extends JFrame {
 
     private static void row(JPanel p, GridBagConstraints c, int y, java.awt.Component... comps) {
         c.gridy = y;
+        c.weighty = y == 0 ? 0 : 1;
         for (int i = 0; i < comps.length; i++) {
             c.gridx = i;
             c.weightx = (comps.length == 4) ? 1 : 1;
+            comps[i].setMinimumSize(new Dimension(180, y == 0 ? 60 : y == 2 ? 180 : 115));
             p.add(comps[i], c);
         }
     }
@@ -468,6 +474,10 @@ public class MainFrame extends JFrame {
     /** 供其他窗口（如汇编编辑器）向主窗口日志追加内容。 */
     public void appendLog(String text) {
         cmdLog.append(text.endsWith("\n") ? text : text + "\n");
+        if (cmdLog.getLineCount() > 1000) {
+            try { cmdLog.replaceRange("", 0, cmdLog.getLineEndOffset(cmdLog.getLineCount() - 801)); }
+            catch (javax.swing.text.BadLocationException ignored) { }
+        }
         cmdLog.setCaretPosition(cmdLog.getDocument().getLength());
     }
 
@@ -530,17 +540,13 @@ public class MainFrame extends JFrame {
         diskPanel.repaint();
 
         // 内核日志增量追加
-        String[] lines = s.logLines().toArray(new String[0]);
-        if (lastLogSize > lines.length) {
-            lastLogSize = 0;
+        for (Kernel.LogEntry entry : kernel.logEntriesAfter(lastLogSequence)) {
+            appendLog(entry.text());
+            lastLogSequence = entry.sequence();
         }
-        for (int i = lastLogSize; i < lines.length; i++) {
-            appendLog(lines[i]);
-        }
-        lastLogSize = lines.length;
     }
 
-    private int lastLogSize;
+    private long lastLogSequence;
 
     private static String formatIds(List<Integer> ids) {
         if (ids.isEmpty()) {
@@ -561,6 +567,7 @@ public class MainFrame extends JFrame {
         for (int pid : s.blockedQueue()) {
             Kernel.PcbView v = s.pcbs().get(pid);
             sb.append("P").append(pid).append("  ").append(v.blockReason())
+                    .append(" 已等待 ").append(Math.max(0, s.systemClock() - v.blockedSince())).append(" 单位")
                     .append(v.device() == null || v.device().equals("—") ? "" : "（" + v.device() + " 剩余 " + deviceRemaining(s, v.device()) + "）")
                     .append('\n');
         }
@@ -661,7 +668,7 @@ public class MainFrame extends JFrame {
 
         private void paintMemory(Graphics2D g) {
             int w = getWidth() - 20;
-            int h = 52;
+            int h = Math.max(10, Math.min(44, getHeight() - 110));
             int x0 = 10;
             int y0 = 30;
             int n = owners.length;
@@ -678,29 +685,27 @@ public class MainFrame extends JFrame {
             g.drawString("512 字节", x0 + w - 52, y0 + h + 14);
 
             // 图例
-            int y = y0 + h + 32;
-            g.drawString("空闲", x0, y + 10);
-            g.setColor(new Color(0xE8E8E8));
-            g.fillRect(x0 + 32, y, 14, 12);
-            g.setColor(Color.DARK_GRAY);
-            g.drawRect(x0 + 32, y, 14, 12);
-            int lx = x0 + 60;
-            for (int pid = 1; pid < 10; pid++) {
-                g.setColor(colorFor(pid));
-                g.fillRect(lx, y, 14, 12);
+            int y = y0 + h + 30;
+            java.util.Set<Integer> labels = new java.util.LinkedHashSet<>();
+            labels.add(-1);
+            for (int owner : owners) if (owner >= 0) labels.add(owner);
+            int columns = Math.max(1, w / 55);
+            int index = 0;
+            for (int pid : labels) {
+                int lx = x0 + index % columns * 55;
+                int ly = y + index / columns * 18;
+                g.setColor(pid < 0 ? new Color(0xE8E8E8) : colorFor(pid));
+                g.fillRect(lx, ly, 12, 12);
                 g.setColor(Color.DARK_GRAY);
-                g.drawRect(lx, y, 14, 12);
-                g.drawString("P" + pid, lx + 16, y + 11);
-                lx += 46;
-                if (lx > getWidth() - 60) {
-                    break;
-                }
+                g.drawRect(lx, ly, 12, 12);
+                g.drawString(pid < 0 ? "空闲" : "P" + pid, lx + 15, ly + 11);
+                index++;
             }
         }
 
         private void paintDisk(Graphics2D g) {
             int cols = 16;
-            int cell = Math.max(8, Math.min(getWidth() / cols - 2, (getHeight() - 40) / cols));
+            int cell = Math.max(1, Math.min((getWidth() - 20) / cols, (getHeight() - 80) / cols));
             int x0 = 10;
             int y0 = 26;
             for (int i = 0; i < fat.length; i++) {
@@ -716,7 +721,8 @@ public class MainFrame extends JFrame {
             g.setFont(new Font("Microsoft YaHei", Font.PLAIN, 11));
             g.setColor(Color.DARK_GRAY);
             int y = y0 + 16 * cell + 14;
-            g.drawString("■ 系统区(FAT/根目录)   ■ 已分配文件块   □ 空闲   ■ 坏块", x0, y);
+            g.drawString("■ 系统区    ■ 已分配", x0, y);
+            g.drawString("□ 空闲      ■ 坏块", x0, y + 16);
         }
 
         private static Color colorForBlock(int index, int fatValue) {

@@ -13,7 +13,7 @@ import java.util.Map;
  *   <li>设备的申请由可执行文件中的 {@code !X?} 指令引起；</li>
  *   <li>有空闲设备时分配设备，然后<b>进程阻塞</b>，同时"设备使用倒计时"开始；</li>
  *   <li>无空闲设备时进程进入该设备的等待队列，直到别的进程释放设备才分配；</li>
- *   <li>倒计时到 0：释放设备并唤醒占用它的进程；同时把等待该设备的进程唤醒（置就绪）；</li>
+ *   <li>倒计时到0：唤醒设备持有者，将设备移交FIFO等待者，等待者完成自己的I/O后才就绪；</li>
  *   <li>设备使用完后<b>立即释放</b>，后续指令要再次使用该设备时需重新申请；</li>
  *   <li>不考虑死锁（本模拟为单设备申请，不存在循环等待）。</li>
  * </ul>
@@ -46,6 +46,13 @@ public class DeviceManager {
     private final List<Device> devices = new ArrayList<>();
     /** 设备类型 → 等待该类型设备的进程队列（先进先出）。 */
     private final Map<String, List<Integer>> waitQueue = new HashMap<>();
+    private final Map<Integer, Integer> requestedDurations = new HashMap<>();
+
+    public void reset() {
+        for (Device d : devices) { d.owner = -1; d.remaining = 0; }
+        for (List<Integer> queue : waitQueue.values()) queue.clear();
+        requestedDurations.clear();
+    }
 
     public DeviceManager() {
         addDevices("A", 2);
@@ -106,6 +113,9 @@ public class DeviceManager {
      * @return 分配到的设备；若失败返回 null
      */
     public Device assign(String type, int pid, int duration) {
+        if (duration < 0 || duration > 9 || pid < 0 || !waitQueue.containsKey(type.toUpperCase()))
+            throw new IllegalArgumentException("非法设备申请");
+        if (deviceOf(pid) != null) throw new IllegalStateException("进程已占用设备");
         Device d = findFree(type);
         if (d == null) {
             return null;
@@ -116,11 +126,13 @@ public class DeviceManager {
     }
 
     /** 进程加入某类设备的等待队列。 */
-    public void enqueueWait(String type, int pid) {
+    public void enqueueWait(String type, int pid, int duration) {
+        if (deviceOf(pid) != null) throw new IllegalStateException("设备持有者不能加入分配等待队列");
         List<Integer> q = waitQueue.computeIfAbsent(type.toUpperCase(), k -> new ArrayList<>());
         if (!q.contains(pid)) {
             q.add(pid);
         }
+        requestedDurations.put(pid, duration);
     }
 
     /**
@@ -144,13 +156,12 @@ public class DeviceManager {
     }
 
     /**
-     * 释放设备并把等待队列队首进程摘出（"同时将等待该设备的另一个进程唤醒"）。
+     * 释放设备并直接分配给FIFO等待者；该等待者继续阻塞直到自己的I/O完成。
      *
-     * @return 被唤醒（置就绪）的进程号；没有等待者返回 -1
+     * @return 获得设备并继续阻塞的等待者进程号；没有等待者返回-1
      */
     public int release(Device d) {
         String type = d.type;
-        int prevOwner = d.owner;
         d.owner = -1;
         d.remaining = 0;
         List<Integer> q = waitQueue.get(type);
@@ -158,11 +169,14 @@ public class DeviceManager {
             return -1;
         }
         int next = q.remove(0);
+        d.owner = next;
+        d.remaining = requestedDurations.remove(next);
         return next;
     }
 
     /** 进程被撤销/唤醒时，把它从所有等待队列里清掉。 */
     public void removeFromAllQueues(int pid) {
+        requestedDurations.remove(pid);
         for (List<Integer> q : waitQueue.values()) {
             q.remove((Integer) pid);
         }

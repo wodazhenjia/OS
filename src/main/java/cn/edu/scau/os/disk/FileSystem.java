@@ -4,6 +4,9 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.nio.file.Path;
+import java.util.function.Supplier;
+import cn.edu.scau.os.instruction.Opcode;
 
 /**
  * 模拟磁盘文件系统：文件分配表（FAT，显式链接）+ 树型目录 + 磁盘空间分配回收。
@@ -23,6 +26,125 @@ public class FileSystem {
     /** 内存中的 FAT 镜像，长度为 FAT 表项数。 */
     private final byte[] fat = new byte[DiskLayout.FAT_ENTRIES];
     private long revisions;
+    private int transactionDepth;
+
+    /** 同一命令中的目录/FAT/数据更新共同提交；异常时恢复整个文件副本。 */
+    private <T> T transaction(Supplier<T> operation) {
+        if (transactionDepth > 0) return operation.get();
+        Path backup = disk.backup("simos-undo-");
+        byte[] savedFat = fat.clone();
+        long savedRevision = revisions;
+        boolean discard = true;
+        transactionDepth++;
+        try {
+            T value = operation.get();
+            disk.flushDirty();
+            return value;
+        } catch (RuntimeException e) {
+            try { disk.restore(backup); }
+            catch (RuntimeException restoreError) { discard = false; e.addSuppressed(restoreError); throw e; }
+            System.arraycopy(savedFat, 0, fat, 0, fat.length);
+            revisions = savedRevision;
+            throw e;
+        } finally {
+            transactionDepth--;
+            if (discard) disk.discardBackup(backup);
+        }
+    }
+
+    /** 加载磁盘，识别并迁移旧版FAT和双字节设备指令。迁移前永久保留原盘副本。 */
+    public void load() {
+        disk.validateSize();
+        for (int i = 0; i < DiskLayout.FAT_BLOCKS; i++) {
+            System.arraycopy(disk.readBlock(i), 0, fat, i * VirtualDisk.BLOCK_SIZE, VirtualDisk.BLOCK_SIZE);
+        }
+        boolean legacy = fatAt(0) == 253;
+        Path legacyBackup = legacy ? disk.backup("disk-legacy-") : null;
+        try {
+            if (legacy) {
+                for (int i = 0; i < fat.length; i++) {
+                    fat[i] = (byte) switch (fatAt(i)) {
+                        case 253 -> DiskLayout.FAT_RESERVED;
+                        case 254 -> DiskLayout.FAT_BAD;
+                        case 255 -> DiskLayout.FAT_EOC;
+                        default -> fatAt(i);
+                    };
+                }
+            }
+            validate();
+            if (legacy) {
+                transaction(() -> { flushFat(); migrateExecutables(DiskLayout.ROOT_BLOCK); return null; });
+                validate();
+            }
+            bump();
+        } catch (RuntimeException e) {
+            if (legacyBackup != null) disk.restore(legacyBackup);
+            throw new IllegalStateException("磁盘加载失败，未格式化；请检查磁盘或恢复备份：" + disk.file(), e);
+        }
+    }
+
+    private void migrateExecutables(int directory) {
+        for (FileEntry entry : list(directory)) {
+            if (entry.isDirectory()) { migrateExecutables(entry.startBlock()); continue; }
+            if (!entry.isExecutable()) continue;
+            byte[] old = readAll(entry);
+            java.io.ByteArrayOutputStream converted = new java.io.ByteArrayOutputStream();
+            for (int pc = 0; pc < old.length; pc++) {
+                int b = old[pc] & 255;
+                if (b <= 63) converted.write(b);
+                else if (b == 64) converted.write(Opcode.OP_INC);
+                else if (b == 65) converted.write(Opcode.OP_DEC);
+                else if (b == 69) converted.write(Opcode.OP_END);
+                else if (b >= 66 && b <= 68 && pc + 1 < old.length) {
+                    int duration = old[++pc] & 255;
+                    if (duration > 9) throw new IllegalStateException("旧设备时间超出0~9，保留原盘，请手工修改：" + entry.displayName());
+                    converted.write((Opcode.OP_DEV_A + ((b - 66) << 4)) | duration);
+                } else throw new IllegalStateException("无法迁移旧指令：" + entry.displayName());
+            }
+            int attributes = entry.attributes();
+            updateEntry(directory, entry.displayName(), attributes & ~DiskLayout.ATTR_READONLY, entry.startBlock(), entry.length());
+            writeFile(directory, entry.name(), entry.extension(), attributes, converted.toByteArray());
+            FileEntry updated = findInDirectory(directory, entry.displayName());
+            updateEntry(directory, entry.displayName(), attributes, updated.startBlock(), updated.length());
+        }
+    }
+
+    /** 检测循环链、共享盘块、非法目录项、短链与泄漏盘块，拒绝带病加载。 */
+    public void validate() {
+        for (int i = 0; i <= DiskLayout.ROOT_BLOCK; i++) {
+            if (fatAt(i) != DiskLayout.FAT_RESERVED) throw new IllegalStateException("系统盘块标记错误：" + i);
+        }
+        boolean[] visited = new boolean[fat.length];
+        validateDirectory(DiskLayout.ROOT_BLOCK, visited);
+        for (int i = DiskLayout.FIRST_DATA_BLOCK; i < fat.length; i++) {
+            if (!visited[i] && fatAt(i) != DiskLayout.FAT_FREE && fatAt(i) != DiskLayout.FAT_BAD)
+                throw new IllegalStateException("存在未被目录引用的盘块：" + i);
+        }
+    }
+    private void validateDirectory(int directory, boolean[] visited) {
+        claimChain(directory, visited);
+        java.util.Set<String> names = new java.util.HashSet<>();
+        for (FileEntry e : list(directory)) {
+            checkName(e.name(), e.extension());
+            if (!names.add(e.displayName().toLowerCase(java.util.Locale.ROOT))) throw new IllegalStateException("重复目录项");
+            if (e.isDirectory()) {
+                if (!e.extension().isEmpty()) throw new IllegalStateException("目录不得有扩展名");
+                validateDirectory(e.startBlock(), visited);
+            } else {
+                List<Integer> blocks = claimChain(e.startBlock(), visited);
+                if (blocks.size() != Math.max(1, (e.length() + 63) / 64)) throw new IllegalStateException("文件长度与FAT链不匹配：" + e.displayName());
+            }
+        }
+    }
+    private List<Integer> claimChain(int start, boolean[] visited) {
+        List<Integer> blocks = chain(start);
+        for (int b : blocks) {
+            if (visited[b] || (b < DiskLayout.FIRST_DATA_BLOCK && b != DiskLayout.ROOT_BLOCK))
+                throw new IllegalStateException("盘块共享或目录成环：" + b);
+            visited[b] = true;
+        }
+        return blocks;
+    }
 
     public FileSystem(VirtualDisk disk) {
         this.disk = disk;
@@ -40,7 +162,7 @@ public class FileSystem {
     private void bump() {
         revisions++;
         // 文件系统发生修改：把攒下的脏盘块落盘，保证 disk 文件始终反映最新内容
-        disk.flushDirty();
+        if (transactionDepth == 0) disk.flushDirty();
     }
 
     // ==================================================================
@@ -120,16 +242,16 @@ public class FileSystem {
     public List<Integer> chain(int startBlock) {
         List<Integer> out = new ArrayList<>();
         int cur = startBlock;
-        int guard = 0;
-        while (cur != DiskLayout.FAT_FREE && cur != DiskLayout.FAT_EOC && cur != DiskLayout.FAT_BAD
-                && cur != DiskLayout.FAT_RESERVED && cur >= 0 && cur < DiskLayout.FAT_ENTRIES) {
+        boolean[] seen = new boolean[fat.length];
+        while (true) {
+            if (cur < DiskLayout.FIRST_DATA_BLOCK && cur != DiskLayout.ROOT_BLOCK || cur >= fat.length || cur < 0 || seen[cur])
+                throw new IllegalStateException("FAT链包含非法盘块或循环，起点：" + startBlock);
+            seen[cur] = true;
             out.add(cur);
-            if (++guard > DiskLayout.FAT_ENTRIES) {
-                throw new IllegalStateException("FAT 链异常：可能成环，起点盘块 " + startBlock);
-            }
-            cur = fatAt(cur);
+            int next = fatAt(cur);
+            if (next == DiskLayout.FAT_EOC || cur == DiskLayout.ROOT_BLOCK && next == DiskLayout.FAT_RESERVED) return out;
+            cur = next;
         }
-        return out;
     }
 
     /** 已分配盘块数（不含系统区）。 */
@@ -195,7 +317,7 @@ public class FileSystem {
         }
         int dot = target.lastIndexOf('.');
         String baseWanted = (dot > 0 ? target.substring(0, dot) : target).trim();
-        String extWanted = dot > 0 ? target.substring(dot + 1).trim() : null;
+        String extWanted = dot > 0 ? target.substring(dot + 1).trim() : "";
 
         for (int block : chain(dirStartBlock)) {
             byte[] data = disk.readBlock(block);
@@ -207,7 +329,7 @@ public class FileSystem {
                 if (!e.name().equalsIgnoreCase(baseWanted)) {
                     continue;
                 }
-                if (extWanted != null && !e.extension().equalsIgnoreCase(extWanted)) {
+                if (!e.extension().equalsIgnoreCase(extWanted)) {
                     continue;
                 }
                 return e;
@@ -282,7 +404,7 @@ public class FileSystem {
                     continue;
                 }
                 FileEntry e = FileEntry.unpack(data, off, off);
-                if (e.name().equalsIgnoreCase(name.trim())) {
+                if (e.displayName().equalsIgnoreCase(name.trim())) {
                     byte[] packed = FileEntry.pack(e.name(), e.extension(), attributes, startBlock, length);
                     System.arraycopy(packed, 0, data, off, DiskLayout.ENTRY_SIZE);
                     disk.writeBlock(block, data);
@@ -342,14 +464,16 @@ public class FileSystem {
 
     /** 规范化路径：分隔符统一为 {@code /}，去掉首尾多余分隔符。 */
     public static String normalize(String path) {
-        String p = path.replace('\\', '/').trim();
-        while (p.startsWith("/")) {
-            p = p.substring(1);
+        if (path == null) throw new IllegalArgumentException("路径不能为空");
+        java.util.Deque<String> segments = new java.util.ArrayDeque<>();
+        for (String part : path.replace('\\', '/').trim().split("/")) {
+            if (part.isEmpty() || part.equals(".")) continue;
+            if (part.equals("..")) {
+                if (segments.isEmpty()) throw new IllegalArgumentException("路径超出根目录");
+                segments.removeLast();
+            } else segments.addLast(part);
         }
-        while (p.endsWith("/")) {
-            p = p.substring(0, p.length() - 1);
-        }
-        return "/" + p;
+        return "/" + String.join("/", segments);
     }
 
     private static String[] split(String path) {
@@ -393,12 +517,13 @@ public class FileSystem {
             System.arraycopy(data, 0, out, written, n);
             written += n;
         }
+        if (written != out.length) throw new IllegalStateException("文件FAT链不完整：" + e.displayName());
         return out;
     }
 
     /** 读取文件内容为字符串（用于 type 命令）。 */
     public String readText(FileEntry e) {
-        return new String(readAll(e), StandardCharsets.US_ASCII);
+        return new String(readAll(e), StandardCharsets.UTF_8);
     }
 
     /**
@@ -410,11 +535,19 @@ public class FileSystem {
      * @return 实际写入的字节数
      */
     public int writeFile(int parentDirBlock, String name, String extension, int attributes, byte[] data) {
-        FileEntry found = findInDirectory(parentDirBlock, name);
+        checkName(name, extension);
+        if (data == null || data.length > 65535) throw new IllegalArgumentException("文件长度不合法");
+        return transaction(() -> writeFileInternal(parentDirBlock, name, extension, attributes, data));
+    }
+    private int writeFileInternal(int parentDirBlock, String name, String extension, int attributes, byte[] data) {
+        String fullName = name + (extension.isEmpty() ? "" : "." + extension);
+        FileEntry found = findInDirectory(parentDirBlock, fullName);
         if (found == null) {
             int first = allocateBlock();
             addEntry(parentDirBlock, name, extension, attributes, first, 0);
-            found = findInDirectory(parentDirBlock, name);
+            found = findInDirectory(parentDirBlock, fullName);
+        } else if (found.isDirectory()) {
+            throw new IllegalStateException("不能把目录当文件写入：" + fullName);
         } else if (found.isReadonly()) {
             throw new IllegalStateException("文件 " + found.displayName() + " 是只读文件，禁止写入");
         }
@@ -423,7 +556,7 @@ public class FileSystem {
         // startBlock 可能是 0（表示尚未分配）
         if (found.startBlock() == DiskLayout.FAT_FREE) {
             int first = allocateBlock();
-            updateEntry(parentDirBlock, name, found.attributes(), first, 0);
+            updateEntry(parentDirBlock, fullName, found.attributes(), first, 0);
             chain = new ArrayList<>(List.of(first));
         }
 
@@ -452,19 +585,20 @@ public class FileSystem {
             disk.writeBlock(block, blk);
             done += Math.max(0, n);
         }
-        updateEntry(parentDirBlock, name, found.attributes(), found.startBlock(), data.length);
+        updateEntry(parentDirBlock, fullName, found.attributes(), found.startBlock(), data.length);
         bump();
         return data.length;
     }
 
     /** 建立一个新的空文件，并占用至少 1 个盘块（指导书：每个文件至少占据一个磁盘块）。 */
     public void createFile(String path, int attributes, byte[] content) {
+        path = normalize(path);
         String base = baseName(path);
         String ext = extensionOf(path);
         checkName(base, ext);
         String dirPath = path.substring(0, path.lastIndexOf('/'));
         int parentBlock = dirPath.isEmpty() ? DiskLayout.ROOT_BLOCK : requireDir(dirPath);
-        if (findInDirectory(parentBlock, base) != null) {
+        if (findInDirectory(parentBlock, base + (ext.isEmpty() ? "" : "." + ext)) != null) {
             throw new IllegalStateException("同名文件已存在：" + path);
         }
         byte[] payload = (content == null || content.length == 0) ? new byte[0] : content;
@@ -490,14 +624,20 @@ public class FileSystem {
                     + " 个字符（如 e），" + ext + " 有 " + ext.length() + " 个字符");
         }
         for (char c : base.toCharArray()) {
-            if (!Character.isLetterOrDigit(c)) {
+            if (!(c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9')) {
                 throw new IllegalArgumentException("文件名/目录名只允许字母和数字，出现非法字符：" + c);
             }
         }
+        if (ext != null && !ext.isEmpty() && !ext.matches("[A-Za-z0-9]")) throw new IllegalArgumentException("扩展名必须是一个ASCII字母或数字");
     }
 
     /** 建立子目录：占一个盘块存放空的目录项表。 */
     public void createDirectory(String path) {
+        String normalized = normalize(path);
+        transaction(() -> { createDirectoryInternal(normalized); return null; });
+    }
+    private void createDirectoryInternal(String path) {
+        if (!extensionOf(path).isEmpty()) throw new IllegalArgumentException("目录没有扩展名");
         String base = baseName(path);
         checkName(base, "");
         String dirPath = path.substring(0, path.lastIndexOf('/'));
@@ -512,6 +652,9 @@ public class FileSystem {
 
     /** 删除文件：归还其占用的全部盘块，并清空目录项。 */
     public void deleteFile(String path) {
+        transaction(() -> { deleteFileInternal(path); return null; });
+    }
+    private void deleteFileInternal(String path) {
         FileEntry e = require(path);
         if (e.isDirectory()) {
             throw new IllegalStateException(path + " 是目录，请使用 rmdir / deldir");
@@ -523,15 +666,19 @@ public class FileSystem {
         for (int block : chain(e.startBlock())) {
             freeBlock(block);
         }
-        clearEntry(parent, e.name());
+        clearEntry(parent, e.displayName());
     }
 
     /** 删除空目录；目录非空时报错（指导书明确要求）。 */
     public void removeEmptyDirectory(String path) {
+        transaction(() -> { removeEmptyDirectoryInternal(path); return null; });
+    }
+    private void removeEmptyDirectoryInternal(String path) {
         FileEntry e = require(path);
         if (!e.isDirectory()) {
             throw new IllegalStateException(path + " 不是目录");
         }
+        if (e.isReadonly()) throw new IllegalStateException("只读目录禁止删除：" + path);
         if (e.startBlock() == DiskLayout.ROOT_BLOCK) {
             throw new IllegalStateException("根目录不能删除");
         }
@@ -547,10 +694,14 @@ public class FileSystem {
 
     /** 删除目录（空或非空都可以，对应可选命令 deldir）。 */
     public void removeDirectoryRecursively(String path) {
+        transaction(() -> { removeDirectoryRecursivelyInternal(path); return null; });
+    }
+    private void removeDirectoryRecursivelyInternal(String path) {
         FileEntry e = require(path);
         if (!e.isDirectory()) {
             throw new IllegalStateException(path + " 不是目录");
         }
+        if (e.isReadonly()) throw new IllegalStateException("只读目录禁止删除：" + path);
         for (FileEntry child : list(e.startBlock())) {
             String childPath = normalize(path) + "/" + child.name() + (child.extension().isEmpty() ? "" : "." + child.extension());
             if (child.isDirectory()) {
@@ -571,7 +722,7 @@ public class FileSystem {
                     continue;
                 }
                 FileEntry e = FileEntry.unpack(data, off, off);
-                if (e.name().equalsIgnoreCase(name.trim())) {
+                if (e.displayName().equalsIgnoreCase(name.trim())) {
                     Arrays.fill(data, off, off + DiskLayout.ENTRY_SIZE, (byte) 0);
                     disk.writeBlock(block, data);
                     bump();
@@ -583,9 +734,13 @@ public class FileSystem {
 
     /** 修改文件属性（change 命令）。 */
     public void changeAttributes(String path, int attributes) {
-        FileEntry e = require(path);
-        int parent = parentDirBlock(path);
-        updateEntry(parent, e.name(), attributes, e.startBlock(), e.length());
+        transaction(() -> {
+            FileEntry e = require(path);
+            int parent = parentDirBlock(path);
+            int preserved = (attributes & ~DiskLayout.ATTR_DIRECTORY) | (e.attributes() & DiskLayout.ATTR_DIRECTORY);
+            updateEntry(parent, e.displayName(), preserved, e.startBlock(), e.length());
+            return null;
+        });
     }
 
     /** 要求路径存在，否则抛错。 */
@@ -630,25 +785,25 @@ public class FileSystem {
         if (e == null) {
             return null;
         }
-        return buildNode(e.name(), e);
+        return buildNode(e.displayName(), e);
     }
 
     public DirNode rootTree() {
         List<DirNode> children = new ArrayList<>();
         for (FileEntry c : listRoot()) {
-            children.add(buildNode(c.name(), c));
+            children.add(buildNode(c.displayName(), c));
         }
-        return new DirNode("/", true, DiskLayout.ROOT_BLOCK, 0, "根目录", children);
+        return new DirNode("/", true, DiskLayout.ROOT_BLOCK, 0, "根目录", List.copyOf(children));
     }
 
     private DirNode buildNode(String name, FileEntry e) {
         List<DirNode> children = new ArrayList<>();
         if (e.isDirectory()) {
             for (FileEntry c : list(e.startBlock())) {
-                children.add(buildNode(c.name(), c));
+                children.add(buildNode(c.displayName(), c));
             }
         }
-        return new DirNode(name, e.isDirectory(), e.startBlock(), e.length(), e.attrText(), children);
+        return new DirNode(name, e.isDirectory(), e.startBlock(), e.length(), e.attrText(), List.copyOf(children));
     }
 
     /** FAT 中每个盘块的占用情况快照（界面"磁盘使用情况"用）。 */

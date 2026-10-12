@@ -7,7 +7,7 @@ package cn.edu.scau.os.process;
  * 并明确"本模拟系统最多容纳 10 个进程控制块"，PCB 区用数组模拟。</p>
  *
  * <p>寄存器部分按指导书"用全局变量或数组模拟重要寄存器"的提示，直接放在 PCB 里，
- * 现场保存/恢复即为这些字段的拷贝。</p>
+     * 现场保存/恢复由CPU寄存器与这些字段之间的拷贝实现。</p>
  */
 public class PCB {
 
@@ -38,7 +38,7 @@ public class PCB {
     public int memBase;
     /** 进程占用内存字节数。 */
     public int memSize;
-    /** 进程映像（可执行文件字节码装入"内存"后的副本）。 */
+    /** 尚未获得内存的程序暂存副本，装入512字节用户区后即清空。 */
     public byte[] image = new byte[0];
     /** 可执行文件路径，便于界面显示与撤销时释放。 */
     public String programPath = "";
@@ -46,6 +46,7 @@ public class PCB {
     public int waitingDevice = -1;
     /** 距离新进程诞生还剩多少个时间单位（由 create 调度用）。 */
     public int arriveCountdown;
+    public int blockedSince = -1;
 
     public void reset() {
         pid = -1;
@@ -63,6 +64,7 @@ public class PCB {
         programPath = "";
         waitingDevice = -1;
         arriveCountdown = 0;
+        blockedSince = -1;
     }
 
     /** 是否是可执行文件装入的"可运行"进程（闲逛进程与等待内存的进程另行判断）。 */

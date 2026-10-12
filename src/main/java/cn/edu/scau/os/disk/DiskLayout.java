@@ -18,13 +18,8 @@ package cn.edu.scau.os.disk;
  * 把 FAT 区扩展为 4 个盘块（0~3），根目录顺延到第 {@link #ROOT_BLOCK} 块，数据区从第 5 块开始。
  * 换算关系：FAT 区 4 块 × 64 字节 = 256 字节 = 256 项，正好放满，不多不少。</p>
  *
- * <h2>如何切换成另一种解释</h2>
- * <p>若指导教师坚持"FAT 恰好占第 0、1 块"，则把下面的常量改为：</p>
- * <pre>
- *   FAT_BLOCKS = 2;  ROOT_BLOCK = 2;  FIRST_DATA_BLOCK = 3;
- * </pre>
- * <p>并把 {@link FileSystem} 中 FAT 大小改为 128（即只管理盘块 0~127）。
- * 全项目盘位均由本类常量派生，改这里即可，无需改动其它文件。</p>
+ * <p>特殊标记使用系统区块号0~3，数据块号5~255与标记不会冲突。
+ * 若需另一种布局，必须同时解决全部256块的寻址与持久化，不能仅缩小FAT。</p>
  */
 public final class DiskLayout {
 
@@ -36,11 +31,11 @@ public final class DiskLayout {
     /** 空闲盘块。 */
     public static final int FAT_FREE = 0;
     /** 文件结束（链尾）。 */
-    public static final int FAT_EOC = 255;
+    public static final int FAT_EOC = 1;
     /** 坏块标记。 */
-    public static final int FAT_BAD = 254;
+    public static final int FAT_BAD = 2;
     /** 系统保留（FAT 自身、根目录所占的块）。 */
-    public static final int FAT_RESERVED = 253;
+    public static final int FAT_RESERVED = 3;
 
     // ---------------- 盘位布局 ----------------
 

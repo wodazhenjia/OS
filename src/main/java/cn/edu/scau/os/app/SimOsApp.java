@@ -29,6 +29,8 @@ public final class SimOsApp {
     }
 
     public static void main(String[] args) throws Exception {
+        // 最先安装：之后的任何未捕获异常都会被记录，界面模式下还会提示一次。
+        CrashReporter.install(Paths.get("runtime", "errors.log"));
         String mode = args.length > 0 ? args[0] : "";
         switch (mode) {
             case "--help", "-h" -> {

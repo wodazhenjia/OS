@@ -215,6 +215,13 @@ public class MainFrame extends JFrame {
         });
         JMenuItem reset = new JMenuItem("重新初始化（格式化磁盘并重建演示数据）");
         reset.addActionListener(e -> {
+            if (!Confirmations.destructive(this, "重新初始化模拟系统",
+                    "将清空模拟磁盘中的全部文件，并重新生成 5 个目录、18 个文件和 10 个可执行文件。\n"
+                            + "正在运行的进程、内存分配与现有的文件修改都会丢失。\n\n"
+                            + "确定重新初始化吗？")) {
+                appendLog("已取消重新初始化");
+                return;
+            }
             kernel.initialize((int) System.currentTimeMillis());
             appendLog("已重新初始化模拟系统");
             refreshSafely();
@@ -478,6 +485,12 @@ public class MainFrame extends JFrame {
     private void runCommand() {
         String line = cmdField.getText();
         if (line == null || line.isBlank()) {
+            return;
+        }
+        // 危险命令先确认；确认放在 exec 之前，避免持有内核锁弹模态框
+        if (Kernel.isDestructiveCommand(line)
+                && !Confirmations.destructive(this, "危险操作", Kernel.destructiveDetail(line))) {
+            appendLog("已取消：" + line.trim());
             return;
         }
         cmdField.setText("");

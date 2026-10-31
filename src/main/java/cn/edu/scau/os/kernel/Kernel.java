@@ -864,6 +864,44 @@ public class Kernel implements CPU.Host {
         }
     }
 
+    /**
+     * 判断一条用户命令是否需要二次确认。
+     *
+     * <p>只做静态判断，不改变 {@link #exec(String)} 的行为：界面在调用 exec 之前询问用户，
+     * 既避免持有内核锁弹模态框，也让这条规则可以无界面测试。</p>
+     */
+    public static boolean isDestructiveCommand(String commandLine) {
+        if (commandLine == null) {
+            return false;
+        }
+        String[] tok = commandLine.trim().split("\\s+");
+        if (tok.length == 0 || tok[0].isEmpty()) {
+            return false;
+        }
+        String cmd = tok[0].toLowerCase(java.util.Locale.ROOT);
+        if ("format".equals(cmd)) {
+            return true;
+        }
+        if ("deldir".equals(cmd) && tok.length >= 2) {
+            return "/".equals(FileSystem.normalize(tok[1]));
+        }
+        return false;
+    }
+
+    /** 危险操作确认框里的说明文字。 */
+    public static String destructiveDetail(String commandLine) {
+        String[] tok = commandLine.trim().split("\\s+");
+        String cmd = tok.length == 0 ? "" : tok[0].toLowerCase(java.util.Locale.ROOT);
+        if ("format".equals(cmd)) {
+            return "format 会清空模拟磁盘中的全部文件，并重新生成演示数据。\n"
+                    + "正在运行的进程、内存分配和此前的文件修改都会丢失。\n\n"
+                    + "确定执行 format 吗？";
+        }
+        return "deldir / 会先删除根目录下的全部内容，再整体回滚一次。\n"
+                + "这个操作代价很大，通常不是想做的事。\n\n"
+                + "确定执行吗？";
+    }
+
     public static String helpText() {
         return """
                 必做命令（注意：目录项名字段只有 3 字节、扩展名只有 1 字节）：

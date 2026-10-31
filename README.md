@@ -21,11 +21,11 @@ Windows（终端为cmd）：
 ```bat
 run.bat
 run.bat build
-run.bat selftest
+run.bat selftest [N]
 run.bat test
 ```
 
-脚本优先使用 `JAVA_HOME`，macOS会查找已安装JDK，否则使用PATH。Windows也兼容旧项目约定的 `%USERPROFILE%\.jdks\ms-21.0.11`。需要完整JDK中的java、javac和jar。
+脚本优先使用 `JAVA_HOME`，macOS会查找已安装JDK，否则使用PATH。Windows会依次探测 `JAVA_HOME`、`%USERPROFILE%\.jdks\ms-21.0.11` 和 `PATH`，取第一个 javac ≥ 21 的 JDK；都不满足时直接提示需要 JDK 21，不会把低版本 JDK 的报错误当成“找不到源文件”。需要完整JDK中的java、javac和jar。
 
 打包后可运行 `java -jar target/simos.jar`。基础自检与新增回归测试使用临时磁盘，**不会格式化项目中的真实模拟磁盘**。测试进程失败返回非零退出状态。
 
@@ -117,10 +117,10 @@ A设备2个，B/C各3个。使用者在自己的I/O完成前保持阻塞。等�
 | mkdir <路径> | 建立目录 |
 | rmdir <路径> | 删除空目录，非空报错 |
 | run <.e路径> | 创建进程运行程序 |
-| deldir <路径> | 递归删除目录 |
+| deldir <路径> | 递归删除目录；`deldir /` 需二次确认 |
 | change <路径> <普通\|只读\|系统> | 修改属性，保留目录类型位 |
 | dir / ls | 显示目录树 |
-| format | 重建演示磁盘与运行状态 |
+| format | 重建演示磁盘与运行状态（需二次确认） |
 | help | 命令帮助 |
 
 create是文件创建命令，run才是进程创建命令。文件命令本身不创建模拟进程，符合题目六的简化要求。
@@ -137,9 +137,17 @@ type /doc/uni
 
 汇编编辑器提供源码、编译清单、反汇编、十六进制转储和按行显示的错误；编译保存后可选择立即运行。源码存档使用UTF-8，保存在 `runtime/PmPt.asm`，与模拟磁盘文件分开。存档失败不会显示成保存成功。
 
+## 故障处理与安全操作
+
+- **启动时磁盘无法加载**（长度不对、FAT/目录校验失败）不会崩溃，也不会自动格式化。界面显示磁盘路径与原因，提供两个选择：「备份并重建」把原盘整体改名为 `runtime/disk-broken-yyyyMMdd-HHmmss.img`（原字节完整保留）后重建演示数据；「退出」则不改动任何文件。重建失败会自动把备份移回原位。
+- **未捕获异常**写入 `runtime/errors.log`，超过1MB轮转为 `errors.log.1`；界面模式下同类异常5秒内只提示一次，无界面自检只写日志不弹窗。
+- **破坏性操作需确认**：菜单「重新初始化」、`format` 命令、`deldir /` 都会弹出确认框，默认选中「取消」；`create/delete/copy/mkdir/rmdir/run` 等正常操作不会被拦。
+- **关闭窗口与菜单「退出」**都先确认，然后在 `try/finally` 中停止模拟线程、释放窗口并退出；即使 CPU 线程2秒内没有停下，进程也会结束并记录警告。
+- **界面刷新连续失败**时会停止自动刷新并提示一次，可从「模拟控制 → 恢复界面刷新」重试，不必重启程序。
+
 ## 验证范围
 
-`--selftest 600` 覆盖22项基础检查。新增 `RequirementsRegressionTest` 使用精确断言，覆盖：
+`--selftest 600` 覆盖22项基础检查。`RequirementsRegressionTest` 使用精确断言，覆盖：
 
 - 全部合法赋值及设备参数的单字节编码、非法编码与参数边界。
 - 64/65字节跨块、全部251个数据块、满盘回读、磁盘满和根目录满的回滚。
@@ -149,6 +157,7 @@ type /doc/uni
 - 精确6条指令轮转、寄存器恢复、设备倒序完成、饱和设备FIFO移交、持有者撤销。
 - 全状态初始化、空程序和超大程序不泄漏PCB、日志保留上限、随机到达及固定种子复现。
 - 并发编辑/创建与快照读取、CPU线程关闭。
+- `RobustnessRegressionTest` 覆盖崩溃日志、坏盘恢复与备份完整性、危险命令判定、重复关机。
 - 原有DirectoryTreeRegressionTest继续验证展开、折叠、选择与目录变化。
 
 测试时持续检查运行/就绪/阻塞队列互斥、设备持有者状态、内存总量与进程回收等不变量。
@@ -157,7 +166,7 @@ type /doc/uni
 
 ```text
 src/main/java/cn/edu/scau/os/
-  app/          入口与基础自检
+  app/          入口、基础自检、崩溃日志与坏盘恢复
   instruction/  单字节指令与汇编器
   disk/         盘块I/O、FAT、目录、事务和旧版迁移
   storage/      512字节内存及链表分区表

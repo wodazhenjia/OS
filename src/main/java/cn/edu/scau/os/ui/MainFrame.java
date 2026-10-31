@@ -1,5 +1,6 @@
 package cn.edu.scau.os.ui;
 
+import cn.edu.scau.os.app.CrashReporter;
 import cn.edu.scau.os.disk.DiskLayout;
 import cn.edu.scau.os.kernel.Kernel;
 import cn.edu.scau.os.instruction.Assembler;
@@ -98,12 +99,18 @@ public class MainFrame extends JFrame {
     private JSlider speedSlider;   // 在 buildSouth() 里创建，菜单"调整时间单位长度"也用它
 
     private Kernel.Snapshot last;
+    /** 内核线程只允许停止一次（windowClosed 与“退出”都会调用）。 */
+    private final java.util.concurrent.atomic.AtomicBoolean shutdownFinished =
+            new java.util.concurrent.atomic.AtomicBoolean();
+    /** 界面刷新失败后置位，避免 200ms 定时器反复抛同一个异常。 */
+    private boolean refreshBroken;
 
     public MainFrame(Kernel kernel) {
         super("SimOS —— 模拟操作系统（题目六原型）");
         this.kernel = kernel;
 
-        setDefaultCloseOperation(DISPOSE_ON_CLOSE);
+        // 关窗不再直接 DISPOSE：先确认，再走统一的退出路径
+        setDefaultCloseOperation(javax.swing.WindowConstants.DO_NOTHING_ON_CLOSE);
         // 按屏幕自适应：保证图 1 的四列布局在小屏上也能完整显示
         java.awt.Rectangle screen = java.awt.GraphicsEnvironment.getLocalGraphicsEnvironment()
                 .getMaximumWindowBounds();
@@ -117,14 +124,31 @@ public class MainFrame extends JFrame {
         add(buildCenter(), BorderLayout.CENTER);
         add(buildSouth(), BorderLayout.SOUTH);
 
-        // 界面刷新：每 200ms 取一次快照重画
-        refreshTimer = new Timer(200, e -> refresh());
+        // 界面刷新：每 200ms 取一次快照重画；单帧异常只停刷新，不让定时器反复抛
+        refreshTimer = new Timer(200, e -> {
+            if (refreshBroken) {
+                return;
+            }
+            try {
+                refresh();
+            } catch (RuntimeException failure) {
+                onRefreshFailure(failure);
+            }
+        });
         refreshTimer.start();
         addWindowListener(new java.awt.event.WindowAdapter() {
             @Override
+            public void windowClosing(java.awt.event.WindowEvent e) {
+                if (confirmExit()) {
+                    quitApplication();
+                }
+            }
+
+            @Override
             public void windowClosed(java.awt.event.WindowEvent e) {
+                // dispose() 之后才到这里，作最后的资源兜底
                 refreshTimer.stop();
-                kernel.shutdown();
+                shutdownKernelQuietly();
             }
         });
 
@@ -172,10 +196,9 @@ public class MainFrame extends JFrame {
             }
         });
         JMenuItem step = new JMenuItem("单步执行一个时间单位");
-        step.addActionListener(e -> {
-            kernel.cpu().step();
-            refresh();
-        });
+        step.addActionListener(e -> stepOnce());
+        JMenuItem resume = new JMenuItem("恢复界面刷新（刷新异常停止后使用）");
+        resume.addActionListener(e -> resumeRefresh());
         JMenuItem editor = new JMenuItem("汇编编辑器（写源码 → 编译 → 保存为 .e）");
         editor.addActionListener(e -> {
             appendLog("打开汇编编辑器：源码按行编写，// 或 # 之后为注释；"
@@ -184,7 +207,7 @@ public class MainFrame extends JFrame {
             dialog.addWindowListener(new java.awt.event.WindowAdapter() {
                 @Override
                 public void windowClosed(java.awt.event.WindowEvent ev) {
-                    refresh();
+                    refreshSafely();
                     appendLog("汇编编辑器已关闭。");
                 }
             });
@@ -194,16 +217,17 @@ public class MainFrame extends JFrame {
         reset.addActionListener(e -> {
             kernel.initialize((int) System.currentTimeMillis());
             appendLog("已重新初始化模拟系统");
-            refresh();
+            refreshSafely();
         });
         JMenuItem quit = new JMenuItem("退出");
         quit.addActionListener(e -> {
-            kernel.shutdown();
-            dispose();
-            System.exit(0);
+            if (confirmExit()) {
+                quitApplication();
+            }
         });
         sim.add(pause);
         sim.add(step);
+        sim.add(resume);
         sim.add(rate);
         javax.swing.JCheckBoxMenuItem arrivals = new javax.swing.JCheckBoxMenuItem("自动随机创建进程", kernel.autoArrivalsEnabled());
         arrivals.addActionListener(e -> kernel.setAutoArrivals(arrivals.isSelected()));
@@ -316,10 +340,7 @@ public class MainFrame extends JFrame {
 
         run.addActionListener(e -> runCommand());
         cmdField.addActionListener(e -> runCommand());
-        step.addActionListener(e -> {
-            kernel.cpu().step();
-            refresh();
-        });
+        step.addActionListener(e -> stepOnce());
         pause.addActionListener(e -> {
             kernel.cpu().setPaused(!kernel.cpu().isPaused());
             appendLog(kernel.cpu().isPaused() ? "模拟已暂停" : "模拟已继续");
@@ -468,7 +489,7 @@ public class MainFrame extends JFrame {
         if (!r.ok()) {
             appendLog("[失败] " + r.message());
         }
-        refresh();
+        refreshSafely();
     }
 
     /** 供其他窗口（如汇编编辑器）向主窗口日志追加内容。 */
@@ -488,6 +509,103 @@ public class MainFrame extends JFrame {
         Kernel.Snapshot s = kernel.snapshot();
         last = s;
         render(s);
+    }
+
+    /** 刷新失败不向事件分发线程抛出，而是停掉定时器并给出可恢复的提示。 */
+    private void refreshSafely() {
+        if (refreshBroken) {
+            return;
+        }
+        try {
+            refresh();
+        } catch (RuntimeException failure) {
+            onRefreshFailure(failure);
+        }
+    }
+
+    /** 单步：执行一个时间单位后立刻刷新；异常处理与定时刷新一致。 */
+    private void stepOnce() {
+        kernel.cpu().step();
+        refreshSafely();
+    }
+
+    // ==================================================================
+    // 退出、关窗与刷新异常兜底
+    // ==================================================================
+
+    /** 关窗与菜单“退出”共用同一个确认。 */
+    private boolean confirmExit() {
+        return Confirmations.choose(this, "退出 SimOS",
+                "将停止模拟线程并退出程序。\n\n"
+                        + "模拟磁盘 runtime/disk.img 会保留，但当前进程、内存与队列状态不会保存。\n\n"
+                        + "确定退出吗？",
+                "退出", "取消");
+    }
+
+    /** 无论停止线程是否成功，都必须释放窗口并结束进程。 */
+    private void quitApplication() {
+        try {
+            refreshTimer.stop();
+            shutdownKernelQuietly();
+        } finally {
+            try {
+                dispose();
+            } catch (RuntimeException ignored) {
+                // 释放失败也要退出
+            }
+            System.exit(0);
+        }
+    }
+
+    /** 幂等：CPU.stop() 在线程 2 秒内没有停下时会抛 IllegalStateException。 */
+    private void shutdownKernelQuietly() {
+        if (!shutdownFinished.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            kernel.shutdown();
+        } catch (RuntimeException failure) {
+            String message = "停止模拟线程失败（进程仍会退出）：" + failure.getMessage();
+            appendLog("[警告] " + message);
+            System.err.println(message);
+        }
+    }
+
+    private void onRefreshFailure(RuntimeException failure) {
+        if (refreshBroken) {
+            return;
+        }
+        refreshBroken = true;
+        refreshTimer.stop();
+        appendLog("[错误] 界面刷新失败，已停止自动刷新：" + failure);
+        CrashReporter.record("界面刷新失败", failure);
+        Object[] options = {"恢复刷新", "退出程序"};
+        int choice = JOptionPane.showOptionDialog(this,
+                "界面刷新出现异常，自动刷新已停止。\n模拟内核可能仍在后台推进。\n\n"
+                        + "可以点「恢复刷新」重试，或退出程序。\n\n"
+                        + "原因：" + failure.getMessage(),
+                "界面刷新已停止", JOptionPane.DEFAULT_OPTION, JOptionPane.ERROR_MESSAGE,
+                null, options, options[1]);
+        if (choice == 0) {
+            resumeRefresh();
+        } else {
+            quitApplication();
+        }
+    }
+
+    private void resumeRefresh() {
+        if (!refreshBroken) {
+            appendLog("界面刷新正常，无需恢复");
+            return;
+        }
+        refreshBroken = false;
+        try {
+            refresh();
+            refreshTimer.start();
+            appendLog("已恢复界面自动刷新");
+        } catch (RuntimeException failure) {
+            onRefreshFailure(failure);
+        }
     }
 
     // ==================================================================

@@ -112,8 +112,12 @@ public final class SimOsApp {
                 + "\n\n「备份并重建」会把当前磁盘改名为\n" + backup.getFileName()
                 + "\n然后重新生成演示数据（磁盘里的原有文件会全部丢失）。\n"
                 + "「退出」不会修改任何文件。";
+        // 用固定宽度的 HTML 包一层：路径/异常信息很长时自动换行，不被对话框右缘裁掉
+        javax.swing.JLabel content = new javax.swing.JLabel(
+                "<html><body style='width:520px'>"
+                        + escapeHtml(message).replace("\n", "<br>") + "</body></html>");
         Object[] options = {"备份并重建", "退出"};
-        int choice = JOptionPane.showOptionDialog(null, message, "模拟磁盘无法加载",
+        int choice = JOptionPane.showOptionDialog(null, content, "模拟磁盘无法加载",
                 JOptionPane.DEFAULT_OPTION, JOptionPane.ERROR_MESSAGE, null, options, options[1]);
         if (choice != 0) {
             System.err.println("已退出：磁盘未修改 → " + disk.toAbsolutePath());
@@ -132,6 +136,11 @@ public final class SimOsApp {
                     "恢复失败", JOptionPane.ERROR_MESSAGE);
             return null;
         }
+    }
+
+    /** JOptionPane 的 HTML 消息需要转义这三个字符。 */
+    private static String escapeHtml(String text) {
+        return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
     }
 
     private static Path resolveDiskFile() {

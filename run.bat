@@ -93,6 +93,8 @@ if /i "%~1"=="test" (
     if errorlevel 1 exit /b 1
     "%JAVA%" -Dstdout.encoding=UTF-8 -Djava.awt.headless=true -cp "target\classes;target\test-classes" cn.edu.scau.os.RequirementsRegressionTest
     if errorlevel 1 exit /b 1
+    "%JAVA%" -Dstdout.encoding=UTF-8 -Djava.awt.headless=true -cp "target\classes;target\test-classes" cn.edu.scau.os.RobustnessRegressionTest
+    if errorlevel 1 exit /b 1
     "%JAVA%" -Dstdout.encoding=UTF-8 -Djava.awt.headless=true -cp "target\classes;target\test-classes" cn.edu.scau.os.ui.DirectoryTreeRegressionTest
     if errorlevel 1 exit /b 1
     exit /b 0

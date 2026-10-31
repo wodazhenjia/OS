@@ -42,6 +42,7 @@ case "${1:-}" in
         find src/test/java -name '*.java' -print0 \
             | xargs -0 "$JAVAC" --release 21 -encoding UTF-8 -cp target/classes -d target/test-classes
         "$JAVA" "${JAVA_OPTIONS[@]}" -Djava.awt.headless=true -cp target/classes:target/test-classes cn.edu.scau.os.RequirementsRegressionTest
+        "$JAVA" "${JAVA_OPTIONS[@]}" -Djava.awt.headless=true -cp target/classes:target/test-classes cn.edu.scau.os.RobustnessRegressionTest
         "$JAVA" "${JAVA_OPTIONS[@]}" -Djava.awt.headless=true -cp target/classes:target/test-classes cn.edu.scau.os.ui.DirectoryTreeRegressionTest
         ;;
     "") exec "$JAVA" "${JAVA_OPTIONS[@]}" -jar target/simos.jar ;;

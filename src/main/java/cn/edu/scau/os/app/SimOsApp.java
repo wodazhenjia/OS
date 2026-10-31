@@ -5,11 +5,14 @@ import cn.edu.scau.os.instruction.Assembler;
 import cn.edu.scau.os.kernel.Kernel;
 import cn.edu.scau.os.ui.MainFrame;
 
+import javax.swing.JOptionPane;
 import javax.swing.SwingUtilities;
 import javax.swing.UIManager;
+import java.awt.GraphicsEnvironment;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.time.Instant;
 
 /**
  * SimOS 启动入口。
@@ -56,8 +59,11 @@ public final class SimOsApp {
 
     private static void launchGui() throws Exception {
         Path disk = resolveDiskFile();
-        Kernel kernel = new Kernel(disk);
-        kernel.boot(20260501);
+        Kernel kernel = bootKernel(disk);
+        if (kernel == null) {
+            System.exit(2);
+            return;
+        }
         kernel.start(500);
 
         SwingUtilities.invokeLater(() -> {
@@ -66,10 +72,66 @@ public final class SimOsApp {
             } catch (Exception ignore) {
                 // 使用默认外观
             }
-            MainFrame f = new MainFrame(kernel);
-            f.setVisible(true);
+            try {
+                MainFrame f = new MainFrame(kernel);
+                f.setVisible(true);
+            } catch (Throwable failure) {
+                // 窗口没建出来时也要留下记录，而不是让进程静默退出
+                CrashReporter.report("启动主界面失败", failure);
+                System.exit(1);
+            }
         });
         System.out.println("SimOS 已启动。模拟磁盘文件：" + disk.toAbsolutePath());
+    }
+
+    /**
+     * 加载磁盘；失败时询问用户是否备份坏盘并重建演示数据。
+     *
+     * @return 可用的内核；用户选择退出或恢复失败时返回 null
+     */
+    private static Kernel bootKernel(Path disk) {
+        try {
+            Kernel kernel = new Kernel(disk);
+            kernel.boot(SafeBoot.BOOT_SEED);
+            return kernel;
+        } catch (RuntimeException failure) {
+            if (GraphicsEnvironment.isHeadless()) {
+                throw failure;   // 自检/测试模式：保持抛出，不弹窗
+            }
+            return recoverInteractively(disk, failure);
+        }
+    }
+
+    /** 先询问，用户同意后才动文件；取消时磁盘一个字节都不改。 */
+    private static Kernel recoverInteractively(Path disk, RuntimeException failure) {
+        Instant now = Instant.now();
+        Path backup = SafeBoot.uniqueBackup(disk, now);
+        String reason = failure.getMessage() == null ? failure.toString() : failure.getMessage();
+        String message = "无法加载模拟磁盘：\n" + disk.toAbsolutePath()
+                + "\n\n原因：" + reason
+                + "\n\n「备份并重建」会把当前磁盘改名为\n" + backup.getFileName()
+                + "\n然后重新生成演示数据（磁盘里的原有文件会全部丢失）。\n"
+                + "「退出」不会修改任何文件。";
+        Object[] options = {"备份并重建", "退出"};
+        int choice = JOptionPane.showOptionDialog(null, message, "模拟磁盘无法加载",
+                JOptionPane.DEFAULT_OPTION, JOptionPane.ERROR_MESSAGE, null, options, options[1]);
+        if (choice != 0) {
+            System.err.println("已退出：磁盘未修改 → " + disk.toAbsolutePath());
+            return null;
+        }
+        try {
+            SafeBoot.Recovery recovery = SafeBoot.recover(disk, now);
+            JOptionPane.showMessageDialog(null,
+                    "已备份为：\n" + recovery.backup().toAbsolutePath() + "\n\n演示数据已重建。",
+                    "磁盘已重建", JOptionPane.INFORMATION_MESSAGE);
+            return recovery.kernel();
+        } catch (Exception recoveryFailure) {
+            JOptionPane.showMessageDialog(null,
+                    "备份或重建失败：" + recoveryFailure.getMessage()
+                            + "\n\n请手动把 disk.img 移走后重新启动。",
+                    "恢复失败", JOptionPane.ERROR_MESSAGE);
+            return null;
+        }
     }
 
     private static Path resolveDiskFile() {

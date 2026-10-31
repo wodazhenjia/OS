@@ -106,7 +106,7 @@ public final class SimOsApp {
     private static Kernel recoverInteractively(Path disk, RuntimeException failure) {
         Instant now = Instant.now();
         Path backup = SafeBoot.uniqueBackup(disk, now);
-        String reason = failure.getMessage() == null ? failure.toString() : failure.getMessage();
+        String reason = describeFailure(failure);
         String message = "无法加载模拟磁盘：\n" + disk.toAbsolutePath()
                 + "\n\n原因：" + reason
                 + "\n\n「备份并重建」会把当前磁盘改名为\n" + backup.getFileName()
@@ -136,6 +136,27 @@ public final class SimOsApp {
                     "恢复失败", JOptionPane.ERROR_MESSAGE);
             return null;
         }
+    }
+
+    /**
+     * 把异常链压成可读文本：外层通常是"磁盘加载失败"，真正的校验原因在 cause 里，
+     * 只显示外层会让用户无法判断坏在哪（例如 FAT 成环、文件链长度不符）。
+     */
+    private static String describeFailure(Throwable failure) {
+        StringBuilder text = new StringBuilder();
+        for (Throwable current = failure; current != null; ) {
+            String message = current.getMessage();
+            if (message == null || message.isBlank()) {
+                message = current.getClass().getSimpleName();
+            }
+            if (text.length() > 0) {
+                text.append("\n  ← ");
+            }
+            text.append(message);
+            Throwable next = current.getCause();
+            current = next == current ? null : next;
+        }
+        return text.toString();
     }
 
     /** JOptionPane 的 HTML 消息需要转义这三个字符。 */

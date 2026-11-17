@@ -44,6 +44,7 @@ case "${1:-}" in
         "$JAVA" "${JAVA_OPTIONS[@]}" -Djava.awt.headless=true -cp target/classes:target/test-classes cn.edu.scau.os.RequirementsRegressionTest
         "$JAVA" "${JAVA_OPTIONS[@]}" -Djava.awt.headless=true -cp target/classes:target/test-classes cn.edu.scau.os.RobustnessRegressionTest
         "$JAVA" "${JAVA_OPTIONS[@]}" -Djava.awt.headless=true -cp target/classes:target/test-classes cn.edu.scau.os.ui.DirectoryTreeRegressionTest
+        "$JAVA" "${JAVA_OPTIONS[@]}" -Djava.awt.headless=true -cp target/classes:target/test-classes cn.edu.scau.os.ui.TextAreaScrollRegressionTest
         ;;
     "") exec "$JAVA" "${JAVA_OPTIONS[@]}" -jar target/simos.jar ;;
 esac

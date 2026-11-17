@@ -30,6 +30,7 @@ import javax.swing.JTree;
 import javax.swing.SwingUtilities;
 import javax.swing.Timer;
 import javax.swing.border.TitledBorder;
+import javax.swing.text.DefaultCaret;
 import java.awt.BorderLayout;
 import java.awt.Color;
 import java.awt.Dimension;
@@ -435,6 +436,7 @@ public class MainFrame extends JFrame {
         a.setEditable(false);
         a.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 11));
         a.setBackground(new Color(0xFAFBFF));
+        ((DefaultCaret) a.getCaret()).setUpdatePolicy(DefaultCaret.NEVER_UPDATE);
         return a;
     }
 
@@ -507,12 +509,7 @@ public class MainFrame extends JFrame {
 
     /** 供其他窗口（如汇编编辑器）向主窗口日志追加内容。 */
     public void appendLog(String text) {
-        cmdLog.append(text.endsWith("\n") ? text : text + "\n");
-        if (cmdLog.getLineCount() > 1000) {
-            try { cmdLog.replaceRange("", 0, cmdLog.getLineEndOffset(cmdLog.getLineCount() - 801)); }
-            catch (javax.swing.text.BadLocationException ignored) { }
-        }
-        cmdLog.setCaretPosition(cmdLog.getDocument().getLength());
+        TextAreaUpdates.appendLog(cmdLog, text);
     }
 
     private void refresh() {
@@ -654,15 +651,15 @@ public class MainFrame extends JFrame {
         runningValue.setText(running == null ? "—" : "P" + running.pid() + "  " + running.name());
         sliceValue.setText(running == null ? "—" : String.valueOf(running.timeSliceLeft()));
 
-        readyArea.setText(formatIds(s.readyQueue()));
-        blockedArea.setText(formatBlocked(s));
-        resultArea.setText(running == null ? "—" : "P" + running.pid() + "  x = " + running.ax() + "  PC = " + running.pc());
-        instrArea.setText(s.currentInstruction() + "\n事件：" + s.lastEvent());
-        resultAlt.setText(String.join("\n", s.results()));
-        deviceArea.setText(formatDevices(s));
-        memText.setText(formatMemory(s));
-        diskText.setText(formatDisk(s));
-        pcbArea.setText(formatPcbs(s));
+        TextAreaUpdates.setText(readyArea, formatIds(s.readyQueue()));
+        TextAreaUpdates.setText(blockedArea, formatBlocked(s));
+        TextAreaUpdates.setText(resultArea, running == null ? "—" : "P" + running.pid() + "  x = " + running.ax() + "  PC = " + running.pc());
+        TextAreaUpdates.setText(instrArea, s.currentInstruction() + "\n事件：" + s.lastEvent());
+        TextAreaUpdates.setText(resultAlt, String.join("\n", s.results()));
+        TextAreaUpdates.setText(deviceArea, formatDevices(s));
+        TextAreaUpdates.setText(memText, formatMemory(s));
+        TextAreaUpdates.setText(diskText, formatDisk(s));
+        TextAreaUpdates.setText(pcbArea, formatPcbs(s));
 
         dirTree.update(s.rootChildren());
         memPanel.setOwners(s.memoryOwners());

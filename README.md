@@ -161,7 +161,7 @@ type /doc/uni
 - 并发编辑/创建与快照读取、CPU线程关闭。
 - `RobustnessRegressionTest` 覆盖崩溃日志、坏盘恢复与备份完整性、危险命令判定、重复关机。
 - 原有DirectoryTreeRegressionTest继续验证展开、折叠、选择与目录变化。
-- `TextAreaScrollRegressionTest` 覆盖信息区滚动保留、内容缩短、连续刷新、日志底部跟随和旧行裁剪，已接入 `run.bat test` 与 `./run.sh test`。
+- `TextAreaScrollRegressionTest` 覆盖信息区滚动保留、内容缩短、连续刷新、日志底部跟随、旧行裁剪、选区与刷新交错及刷新后的光标导航，已接入 `run.bat test` 与 `./run.sh test`。
 
 测试时持续检查运行/就绪/阻塞队列互斥、设备持有者状态、内存总量与进程回收等不变量。
 

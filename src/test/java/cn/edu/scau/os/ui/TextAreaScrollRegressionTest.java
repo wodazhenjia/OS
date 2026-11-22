@@ -26,12 +26,13 @@ public final class TextAreaScrollRegressionTest {
                 }
             });
             statusUpdates();
+            pendingCaretScrolling();
             logFollowing();
             logTrimming();
             initiallyEmpty();
         }
         System.out.println("Text area scroll regression passed: " + assertions + " assertions, "
-                + lookAndFeels.size() + " look and feels, 4 groups each");
+                + lookAndFeels.size() + " look and feels, 5 groups each");
     }
 
     private static void statusUpdates() throws Exception {
@@ -94,6 +95,83 @@ public final class TextAreaScrollRegressionTest {
         });
         settle();
         edt(() -> fixture.checkPosition(expected[0], "Later user scrolling is not overwritten by queued restoration"));
+    }
+
+    private static void pendingCaretScrolling() throws Exception {
+        Point[] expected = {null};
+        for (boolean queuedRefresh : new boolean[]{false, true}) {
+            edt(() -> fixture = new Fixture(lines(0, 80, "initial")));
+            settle();
+            edt(() -> {
+                expected[0] = fixture.scrollTo(70, 310);
+                // 模拟已在事件队列中的定时刷新，先于选区产生的光标重绘执行。
+                if (queuedRefresh) {
+                    SwingUtilities.invokeLater(() ->
+                            TextAreaUpdates.setText(fixture.area, lines(0, 81, "changed")));
+                }
+                selectLine(25);
+                if (!queuedRefresh) {
+                    TextAreaUpdates.setText(fixture.area, lines(0, 81, "changed"));
+                }
+            });
+            settle();
+            edt(() -> {
+                check(fixture.area.getText().equals(lines(0, 81, "changed")), "Queued snapshot is displayed");
+                fixture.checkPosition(expected[0], "Pending caret scrolling cannot undo snapshot restoration");
+            });
+        }
+
+        edt(() -> {
+            selectLine(25);
+            TextAreaUpdates.setText(fixture.area, lines(0, 82, "later"));
+            expected[0] = fixture.scrollTo(95, 420);
+        });
+        settle();
+        edt(() -> fixture.checkPosition(expected[0], "Pending caret scrolling cannot undo later user scrolling"));
+
+        // 抑制过期任务后，新的光标移动仍应能将目标位置滚入视野。
+        edt(() -> fixture.area.setCaretPosition(10));
+        settle();
+        edt(() -> checkCaretVisible("New caret positioning still scrolls into view"));
+        edt(() -> {
+            try {
+                fixture.area.moveCaretPosition(fixture.area.getLineStartOffset(60) + 100);
+            } catch (javax.swing.text.BadLocationException failure) {
+                throw new AssertionError(failure);
+            }
+        });
+        settle();
+        edt(() -> checkCaretVisible("New selection extension still scrolls into view"));
+
+        edt(() -> fixture = new Fixture(lines(0, 999, "history")));
+        settle();
+        edt(() -> {
+            int height = fixture.lineHeight();
+            fixture.scrollTo(80, 400 * height + 3);
+            expected[0] = new Point(80, fixture.position().y - 201 * height);
+            SwingUtilities.invokeLater(() -> TextAreaUpdates.appendLog(fixture.area, "trim trigger"));
+            selectLine(401);
+        });
+        settle();
+        edt(() -> fixture.checkPosition(expected[0], "Pending caret scrolling cannot undo log trimming compensation"));
+    }
+
+    private static void selectLine(int line) {
+        try {
+            int start = fixture.area.getLineStartOffset(line) + 20;
+            fixture.area.select(start, start + 4);
+        } catch (javax.swing.text.BadLocationException failure) {
+            throw new AssertionError(failure);
+        }
+    }
+
+    private static void checkCaretVisible(String message) {
+        try {
+            check(fixture.scroll.getViewport().getViewRect().contains(
+                    fixture.area.modelToView2D(fixture.area.getCaretPosition()).getBounds()), message);
+        } catch (javax.swing.text.BadLocationException failure) {
+            throw new AssertionError(failure);
+        }
     }
 
     private static void logFollowing() throws Exception {

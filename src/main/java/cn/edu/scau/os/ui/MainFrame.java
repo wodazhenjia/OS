@@ -30,7 +30,6 @@ import javax.swing.JTree;
 import javax.swing.SwingUtilities;
 import javax.swing.Timer;
 import javax.swing.border.TitledBorder;
-import javax.swing.text.DefaultCaret;
 import java.awt.BorderLayout;
 import java.awt.Color;
 import java.awt.Dimension;
@@ -436,7 +435,7 @@ public class MainFrame extends JFrame {
         a.setEditable(false);
         a.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 11));
         a.setBackground(new Color(0xFAFBFF));
-        ((DefaultCaret) a.getCaret()).setUpdatePolicy(DefaultCaret.NEVER_UPDATE);
+        TextAreaUpdates.installCaret(a);
         return a;
     }
 

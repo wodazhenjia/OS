@@ -5,24 +5,36 @@ import javax.swing.JTextArea;
 import javax.swing.JViewport;
 import javax.swing.SwingUtilities;
 import javax.swing.text.BadLocationException;
+import javax.swing.text.DefaultCaret;
+import javax.swing.text.Position;
 import java.awt.Dimension;
 import java.awt.Point;
+import java.awt.Rectangle;
 
 /** 主窗口只读文本的刷新策略；所有操作都由 Swing EDT 调用。 */
 final class TextAreaUpdates {
     private TextAreaUpdates() { }
+
+    static void installCaret(JTextArea area) {
+        DefaultCaret caret = new ReadingCaret();
+        caret.setBlinkRate(area.getCaret().getBlinkRate());
+        caret.setUpdatePolicy(DefaultCaret.NEVER_UPDATE);
+        area.setCaret(caret);
+    }
 
     static void setText(JTextArea area, String text) {
         if (text.equals(area.getText())) {
             return;
         }
         ViewState state = ViewState.capture(area);
+        cancelPendingCaretScroll(area);
         area.setText(text);
         state.restore(false, 0);
     }
 
     static void appendLog(JTextArea area, String text) {
         ViewState state = ViewState.capture(area);
+        cancelPendingCaretScroll(area);
         area.append(text.endsWith("\n") ? text : text + "\n");
         int removedLines = 0;
         if (area.getLineCount() > 1000) {
@@ -36,6 +48,40 @@ final class TextAreaUpdates {
         // 主窗口日志不折行，每删一行需向上补偿一个行高，保持正在阅读的内容。
         int removedHeight = removedLines * area.getFontMetrics(area.getFont()).getHeight();
         state.restore(state.atBottom, removedHeight);
+    }
+
+    private static void cancelPendingCaretScroll(JTextArea area) {
+        if (area.getCaret() instanceof ReadingCaret caret) {
+            caret.scrollRequested = false;
+        }
+    }
+
+    /**
+     * NEVER_UPDATE 只阻止文档修改触发光标移动，不能取消先前选区排队的自动滚动。
+     * 刷新后忽略这些过期请求；只有新的光标移动或选区操作才重新允许自动滚动。
+     * 不延迟恢复视口，避免覆盖用户在刷新后主动进行的滚动。
+     */
+    private static final class ReadingCaret extends DefaultCaret {
+        private boolean scrollRequested;
+
+        @Override
+        public void setDot(int dot, Position.Bias bias) {
+            scrollRequested = true;
+            super.setDot(dot, bias);
+        }
+
+        @Override
+        public void moveDot(int dot, Position.Bias bias) {
+            scrollRequested = true;
+            super.moveDot(dot, bias);
+        }
+
+        @Override
+        protected void adjustVisibility(Rectangle location) {
+            if (scrollRequested) {
+                super.adjustVisibility(location);
+            }
+        }
     }
 
     private static final class ViewState {

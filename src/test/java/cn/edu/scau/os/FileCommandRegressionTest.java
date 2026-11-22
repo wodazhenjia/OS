@@ -193,5 +193,15 @@ public final class FileCommandRegressionTest {
         recovered.kernel().fs().validate();
         Kernel backup = new Kernel(recovered.backup()); backup.boot(42);
         check(ok(backup, "type /sav").contains("retained-in-backup"), "Recovered backup can be mounted with its table");
+
+        Kernel missingImage = kernel(); ok(missingImage, "fdisk create data 64");
+        Path orphanedTable = PartitionManager.tablePath(missingImage.disk().file());
+        byte[] orphanedBytes = Files.readAllBytes(orphanedTable);
+        Files.delete(missingImage.disk().file());
+        rejects(() -> new Kernel(missingImage.disk().file()).boot(42), "Orphaned partition table requires explicit recovery");
+        SafeBoot.Recovery fresh = SafeBoot.recover(missingImage.disk().file(), Instant.parse("2026-11-22T00:00:00Z"));
+        check(Files.exists(fresh.backup()) && Arrays.equals(orphanedBytes, Files.readAllBytes(fresh.backup())), "Missing-image recovery backs up surviving metadata");
+        check(!Files.exists(orphanedTable) && fresh.kernel().location().equals("main:/"), "Missing-image recovery creates usable standalone disk");
+        fresh.kernel().fs().validate();
     }
 }

@@ -26,7 +26,7 @@ public final class SafeBoot {
     private static final DateTimeFormatter STAMP =
             DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss").withZone(ZoneId.systemDefault());
 
-    /** 恢复结果：可用的内核 + 坏盘备份文件。 */
+    /** 恢复结果：可用内核与现存数据的备份文件（镜像缺失时返回分区表备份）。 */
     public record Recovery(Kernel kernel, Path backup) {
     }
 
@@ -41,21 +41,29 @@ public final class SafeBoot {
      */
     public static Recovery recover(Path diskFile, Instant now) throws IOException {
         Path backup = uniqueBackup(diskFile, now);
-        move(diskFile, backup);
         Path table = PartitionManager.tablePath(diskFile);
         Path tableBackup = PartitionManager.tablePath(backup);
+        if (!Files.exists(diskFile) && !Files.exists(table))
+            throw new java.nio.file.NoSuchFileException(diskFile.toString());
+        boolean movedDisk = false;
         boolean movedTable = false;
         try {
+            if (Files.exists(diskFile)) { move(diskFile, backup); movedDisk = true; }
             if (Files.exists(table)) { move(table, tableBackup); movedTable = true; }
             Kernel kernel = new Kernel(diskFile);
             kernel.initialize(BOOT_SEED);
-            return new Recovery(kernel, backup);
+            return new Recovery(kernel, movedDisk ? backup : tableBackup);
         } catch (RuntimeException | IOException failure) {
+            // 分别恢复，避免镜像回滚失败时连分区表也不尝试恢复。
             try {
-                Files.move(backup, diskFile, StandardCopyOption.REPLACE_EXISTING);
-                if (movedTable) Files.move(tableBackup, table, StandardCopyOption.REPLACE_EXISTING);
+                if (movedDisk) Files.move(backup, diskFile, StandardCopyOption.REPLACE_EXISTING);
+                else if (movedTable) Files.deleteIfExists(diskFile);
             } catch (IOException restoreFailure) {
                 failure.addSuppressed(restoreFailure);
+            }
+            if (movedTable) {
+                try { Files.move(tableBackup, table, StandardCopyOption.REPLACE_EXISTING); }
+                catch (IOException restoreFailure) { failure.addSuppressed(restoreFailure); }
             }
             throw failure;
         }

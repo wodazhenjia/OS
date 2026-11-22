@@ -6,6 +6,7 @@ import cn.edu.scau.os.disk.DiskLayout;
 import cn.edu.scau.os.disk.FileEntry;
 import cn.edu.scau.os.disk.FileSystem;
 import cn.edu.scau.os.disk.VirtualDisk;
+import cn.edu.scau.os.disk.PartitionManager;
 import cn.edu.scau.os.instruction.Assembler;
 import cn.edu.scau.os.process.BlockReason;
 import cn.edu.scau.os.process.PCB;
@@ -40,6 +41,8 @@ public class Kernel implements CPU.Host {
     private final Object lock = new Object();
     private final VirtualDisk disk;
     private final FileSystem fs;
+    private final PartitionManager partitions;
+    private String currentDirectory = "/";
     private final MemoryManager memory = new MemoryManager();
     private final DeviceManager devices = new DeviceManager();
     private final Scheduler scheduler = new Scheduler();
@@ -66,6 +69,7 @@ public class Kernel implements CPU.Host {
     public Kernel(Path diskFile) {
         this.disk = new VirtualDisk(diskFile);
         this.fs = new FileSystem(disk);
+        this.partitions = new PartitionManager(disk, fs);
         this.cpu = new CPU(scheduler, memory, devices, fs, this, lock);
         setupIdleProcess();
     }
@@ -133,20 +137,23 @@ public class Kernel implements CPU.Host {
     /** 正常启动加载已有磁盘；仅首次启动建立演示数据。 */
     public void boot(int seed) {
         synchronized (lock) {
+            partitions.load();
             if (disk.exists()) fs.load();
             else { fs.format(); SeedBuilder.build(fs); }
             resetRuntime(seed);
         }
     }
-    /** 用户显式重新初始化/格式化时重建演示数据。 */
+    /** 显式格式化当前分区；完整分区重建演示数据，小分区留空。 */
     public void initialize(int seed) {
         synchronized (lock) {
+            partitions.load();
             fs.format();
-            SeedBuilder.build(fs);
+            if (disk.blockCount() == VirtualDisk.BLOCK_COUNT) SeedBuilder.build(fs);
             resetRuntime(seed);
         }
     }
     private void resetRuntime(int seed) {
+        currentDirectory = "/";
         random.setSeed(seed);
         scheduler.reset(); memory.reset(); devices.reset(); cpu.reset();
         systemClock = 0;
@@ -714,7 +721,7 @@ public class Kernel implements CPU.Host {
     /**
      * 执行一条用户命令。指导书要求的必做命令：
      * create / delete / type / copy / mkdir / rmdir；
-     * 可选命令：chdir / deldir / move / change / format / fdk。
+     * 可选命令：chdir / deldir / move / change / format / fdisk（别名 fdk）。
      */
     public CommandResult exec(String commandLine) {
         String line = commandLine == null ? "" : commandLine.trim();
@@ -723,18 +730,42 @@ public class Kernel implements CPU.Host {
         }
         synchronized (lock) {
             String[] tok = line.split("\\s+");
-            String cmd = tok[0].toLowerCase();
+            String cmd = tok[0].toLowerCase(java.util.Locale.ROOT);
             try {
                 switch (cmd) {
+                    case "chdir", "cd": {
+                        exactArgs(tok, tok.length == 1 ? 1 : 2, "chdir [目录路径]");
+                        if (tok.length == 2) {
+                            String path = commandPath(tok[1]);
+                            fs.requireDir(path);
+                            currentDirectory = path;
+                        }
+                        return new CommandResult(true, "当前目录：" + location());
+                    }
+                    case "move": {
+                        exactArgs(tok, 3, "move <源路径> <目标路径或目录>");
+                        String source = commandPath(tok[1]);
+                        String target = fs.move(source, commandPath(tok[2]));
+                        if (within(currentDirectory, source)) currentDirectory = target + currentDirectory.substring(source.length());
+                        for (PCB p : scheduler.pcbs()) {
+                            if (p.programPath != null && within(p.programPath, source))
+                                p.programPath = target + p.programPath.substring(source.length());
+                        }
+                        log("move " + source + " -> " + target);
+                        return new CommandResult(true, "已移动 " + source + " -> " + target);
+                    }
+                    case "fdisk", "fdk": {
+                        return partitionCommand(tok);
+                    }
                     case "run": {
                         requireArgs(tok, 2, "run <可执行文件路径>");
-                        int pid = create(FileSystem.normalize(tok[1]));
+                        int pid = create(commandPath(tok[1]));
                         return new CommandResult(pid >= 0, pid < 0 ? "无法创建进程，请检查文件与PCB容量"
                                 : "已创建进程P" + pid + "，状态：" + scheduler.pcb(pid).state.text());
                     }
                     case "create": {
                         requireArgs(tok, 2, "create <路径> [文本内容]");
-                        String path = FileSystem.normalize(tok[1]);
+                        String path = commandPath(tok[1]);
                         // 内容可以是"文本"，也可以是汇编源码（写入 .e 文件时自动汇编）；
                         // 若某个参数以 asm: 开头，则其后的内容按汇编源码处理。
                         StringBuilder sb = new StringBuilder();
@@ -762,7 +793,7 @@ public class Kernel implements CPU.Host {
                     }
                     case "delete": {
                         requireArgs(tok, 2, "delete <路径>");
-                        String path = FileSystem.normalize(tok[1]);
+                        String path = commandPath(tok[1]);
                         fs.deleteFile(path);
                         retryMemoryWaiters();
                         log("delete " + path);
@@ -770,7 +801,7 @@ public class Kernel implements CPU.Host {
                     }
                     case "type": {
                         requireArgs(tok, 2, "type <路径>");
-                        String path = FileSystem.normalize(tok[1]);
+                        String path = commandPath(tok[1]);
                         FileEntry e = fs.require(path);
                         if (e.isDirectory()) {
                             return new CommandResult(false, path + " 是目录，不能 type");
@@ -783,8 +814,8 @@ public class Kernel implements CPU.Host {
                     }
                     case "copy": {
                         requireArgs(tok, 3, "copy <源路径> <目标路径>");
-                        String src = FileSystem.normalize(tok[1]);
-                        String dst = FileSystem.normalize(tok[2]);
+                        String src = commandPath(tok[1]);
+                        String dst = commandPath(tok[2]);
                         // copy 允许显式给出目标扩展名：copy /aa/ccc /dd/nnn e
                         if (tok.length >= 4 && !tok[3].isBlank()) {
                             dst = FileSystem.normalize(dst + "." + tok[3]);
@@ -795,14 +826,15 @@ public class Kernel implements CPU.Host {
                     }
                     case "mkdir": {
                         requireArgs(tok, 2, "mkdir <路径>");
-                        String path = FileSystem.normalize(tok[1]);
+                        String path = commandPath(tok[1]);
                         fs.createDirectory(path);
                         log("mkdir " + path);
                         return new CommandResult(true, "已建立目录 " + path);
                     }
                     case "rmdir": {
                         requireArgs(tok, 2, "rmdir <路径>");
-                        String path = FileSystem.normalize(tok[1]);
+                        String path = commandPath(tok[1]);
+                        protectCurrentDirectory(path);
                         fs.removeEmptyDirectory(path);
                         retryMemoryWaiters();
                         log("rmdir " + path);
@@ -810,14 +842,15 @@ public class Kernel implements CPU.Host {
                     }
                     case "deldir": {
                         requireArgs(tok, 2, "deldir <路径>");
-                        String path = FileSystem.normalize(tok[1]);
+                        String path = commandPath(tok[1]);
+                        protectCurrentDirectory(path);
                         fs.removeDirectoryRecursively(path);
                         log("deldir " + path);
                         return new CommandResult(true, "已删除目录（含内容）" + path);
                     }
                     case "change": {
                         requireArgs(tok, 3, "change <路径> <属性: 普通|只读|系统>");
-                        String path = FileSystem.normalize(tok[1]);
+                        String path = commandPath(tok[1]);
                         int attr = switch (tok[2]) {
                             case "只读", "readonly", "ro" -> DiskLayout.ATTR_READONLY;
                             case "系统", "system" -> DiskLayout.ATTR_SYSTEM;
@@ -828,13 +861,17 @@ public class Kernel implements CPU.Host {
                         return new CommandResult(true, "已修改属性 " + path);
                     }
                     case "dir", "ls": {
+                        exactArgs(tok, tok.length == 1 ? 1 : 2, "dir [目录路径]");
+                        String path = tok.length == 1 ? currentDirectory : commandPath(tok[1]);
+                        fs.requireDir(path);
                         StringBuilder sb = new StringBuilder();
-                        renderTree(fs.rootTree(), 0, sb);
+                        renderTree(path.equals("/") ? fs.rootTree() : fs.tree(path), 0, sb);
                         return new CommandResult(true, sb.toString());
                     }
                     case "format": {
                         initialize((int) System.currentTimeMillis());
-                        return new CommandResult(true, "磁盘已格式化（注意：演示数据已重建）");
+                        return new CommandResult(true, "当前分区已格式化：" + partitions.activeName()
+                                + (disk.blockCount() == VirtualDisk.BLOCK_COUNT ? "（演示数据已重建）" : "（空文件系统）"));
                     }
                     case "help": {
                         return new CommandResult(true, helpText());
@@ -853,6 +890,53 @@ public class Kernel implements CPU.Host {
         if (tok.length < n) {
             throw new IllegalArgumentException("参数不足，用法：" + usage);
         }
+    }
+
+    public String location() {
+        synchronized (lock) { return partitions.activeName() + ":" + currentDirectory; }
+    }
+
+    private String commandPath(String path) {
+        String value = path.replace('\\', '/');
+        return FileSystem.normalize(value.startsWith("/") ? value : currentDirectory + "/" + value);
+    }
+
+    private static boolean within(String path, String parent) {
+        String p = path.toLowerCase(java.util.Locale.ROOT), root = parent.toLowerCase(java.util.Locale.ROOT);
+        return p.equals(root) || root.equals("/") || p.startsWith(root + "/");
+    }
+
+    private void protectCurrentDirectory(String path) {
+        if (within(currentDirectory, path)) throw new IllegalStateException("不能删除当前目录或其父目录，请先 chdir / 切换目录");
+    }
+
+    private static void exactArgs(String[] tok, int count, String usage) {
+        if (tok.length != count) throw new IllegalArgumentException("用法：" + usage);
+    }
+
+    private CommandResult partitionCommand(String[] tok) {
+        if (tok.length == 1 || tok.length == 2 && tok[1].equalsIgnoreCase("list"))
+            return new CommandResult(true, partitions.describe());
+        switch (tok[1].toLowerCase(java.util.Locale.ROOT)) {
+            case "create" -> {
+                exactArgs(tok, 4, "fdisk create <分区名> <盘块数>");
+                partitions.create(tok[2], Integer.parseInt(tok[3]));
+            }
+            case "delete" -> {
+                exactArgs(tok, 3, "fdisk delete <分区名>");
+                partitions.delete(tok[2]);
+            }
+            case "use" -> {
+                exactArgs(tok, 3, "fdisk use <分区名>");
+                if (scheduler.freeQueue().size() != Scheduler.MAX_PROCESS - 1)
+                    throw new IllegalStateException("仍有用户进程，请等待进程结束后切换分区");
+                partitions.use(tok[2]);
+                resetRuntime((int) System.currentTimeMillis());
+            }
+            default -> throw new IllegalArgumentException("用法：fdisk [list | create <名> <块数> | delete <名> | use <名>]");
+        }
+        log(String.join(" ", tok));
+        return new CommandResult(true, partitions.describe());
     }
 
     private void renderTree(FileSystem.DirNode node, int depth, StringBuilder sb) {
@@ -882,8 +966,10 @@ public class Kernel implements CPU.Host {
         if ("format".equals(cmd)) {
             return true;
         }
+        if (("fdisk".equals(cmd) || "fdk".equals(cmd)) && tok.length >= 2 && "delete".equalsIgnoreCase(tok[1])) return true;
         if ("deldir".equals(cmd) && tok.length >= 2) {
-            return "/".equals(FileSystem.normalize(tok[1]));
+            try { return "/".equals(FileSystem.normalize(tok[1])); }
+            catch (IllegalArgumentException invalidRelativePath) { return false; }
         }
         return false;
     }
@@ -892,13 +978,15 @@ public class Kernel implements CPU.Host {
     public static String destructiveDetail(String commandLine) {
         String[] tok = commandLine.trim().split("\\s+");
         String cmd = tok.length == 0 ? "" : tok[0].toLowerCase(java.util.Locale.ROOT);
+        if ("fdisk".equals(cmd) || "fdk".equals(cmd))
+            return "删除分区会清空该分区内的所有模拟文件，释放其物理盘块。\n确定删除分区吗？";
         if ("format".equals(cmd)) {
-            return "format 会清空模拟磁盘中的全部文件，并重新生成演示数据。\n"
+            return "format 会清空当前分区，完整256块分区重新生成演示数据，小分区建立空文件系统。\n"
                     + "正在运行的进程、内存分配和此前的文件修改都会丢失。\n\n"
                     + "确定执行 format 吗？";
         }
-        return "deldir / 会先删除根目录下的全部内容，再整体回滚一次。\n"
-                + "这个操作代价很大，通常不是想做的事。\n\n"
+        return "根目录不能删除，deldir / 会被拒绝。\n"
+                + "请先切换目录，再指定其他目录进行删除。\n\n"
                 + "确定执行吗？";
     }
 
@@ -912,11 +1000,17 @@ public class Kernel implements CPU.Host {
                   mkdir  <路径>               建立目录（无扩展名）
                   rmdir  <路径>               删除空目录（非空报错）
                 可选命令：
+                  chdir [目录路径]            切换目录；无参数显示当前目录（别名 cd）
+                  move <源> <目标>            移动或重命名文件/目录，拒绝覆盖
+                  fdisk [list]                查看模拟分区表（别名 fdk）
+                  fdisk create <名> <块数>     新建分区；从未分配区或当前分区空闲尾部划分
+                  fdisk use <名>              切换分区（须无用户进程），回到根目录
+                  fdisk delete <名>           删除非当前分区（需确认）
                   run <路径>                  创建进程运行.e文件
                   deldir <路径>               删除目录（含内容）
                   change <路径> <属性>        修改属性（普通/只读/系统）
-                  dir                         显示目录树
-                  format                      格式化磁盘并重建演示数据
+                  dir [路径]                  显示当前目录或指定目录树
+                  format                      格式化当前分区
                   help                        显示本帮助
                 示例：
                   create /aa/bb.e x=1|x++|!A3|end    （用 | 分隔汇编源码的每一行）

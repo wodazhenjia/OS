@@ -213,10 +213,11 @@ public class MainFrame extends JFrame {
             });
             dialog.setVisible(true);
         });
-        JMenuItem reset = new JMenuItem("重新初始化（格式化磁盘并重建演示数据）");
+        JMenuItem reset = new JMenuItem("重新初始化（格式化当前分区）");
         reset.addActionListener(e -> {
             if (!Confirmations.destructive(this, "重新初始化模拟系统",
-                    "将清空模拟磁盘中的全部文件，并重新生成 5 个目录、18 个文件和 10 个可执行文件。\n"
+                    "将清空当前分区：" + kernel.location() + "。\n"
+                            + "完整256块分区重建演示数据，小分区建立空文件系统；其他分区保留。\n"
                             + "正在运行的进程、内存分配与现有的文件修改都会丢失。\n\n"
                             + "确定重新初始化吗？")) {
                 appendLog("已取消重新初始化");
@@ -644,6 +645,7 @@ public class MainFrame extends JFrame {
     }
 
     private void render(Kernel.Snapshot s) {
+        cmdField.setToolTipText("当前分区与目录：" + kernel.location());
         clockValue.setText(String.valueOf(s.systemClock()));
         updateSpeedText();
         Kernel.PcbView running = s.pcbs().stream().filter(p -> "运行".equals(p.state())).findFirst().orElse(null);
@@ -735,8 +737,9 @@ public class MainFrame extends JFrame {
         return sb.toString();
     }
 
-    private static String formatDisk(Kernel.Snapshot s) {
-        return String.format("""
+    private String formatDisk(Kernel.Snapshot s) {
+        return "当前位置：" + kernel.location() + "\n当前分区：" + kernel.disk().blockCount()
+                + " 块，物理起点 " + kernel.disk().firstBlock() + "\n" + String.format("""
                         已用盘块：%d
                         空闲盘块：%d
                         数据区起始盘块：%d
@@ -848,7 +851,7 @@ public class MainFrame extends JFrame {
             g.setFont(new Font("Microsoft YaHei", Font.PLAIN, 11));
             g.setColor(Color.DARK_GRAY);
             int y = y0 + 16 * cell + 14;
-            g.drawString("■ 系统区    ■ 已分配", x0, y);
+            g.drawString("■ 保留/分区外 ■ 已分配", x0, y);
             g.drawString("□ 空闲      ■ 坏块", x0, y + 16);
         }
 

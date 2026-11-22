@@ -116,9 +116,12 @@ public class FileSystem {
         }
         boolean[] visited = new boolean[fat.length];
         validateDirectory(DiskLayout.ROOT_BLOCK, visited);
-        for (int i = DiskLayout.FIRST_DATA_BLOCK; i < fat.length; i++) {
+        for (int i = DiskLayout.FIRST_DATA_BLOCK; i < disk.blockCount(); i++) {
             if (!visited[i] && fatAt(i) != DiskLayout.FAT_FREE && fatAt(i) != DiskLayout.FAT_BAD)
                 throw new IllegalStateException("存在未被目录引用的盘块：" + i);
+        }
+        for (int i = disk.blockCount(); i < fat.length; i++) {
+            if (fatAt(i) != DiskLayout.FAT_RESERVED) throw new IllegalStateException("分区外FAT项不是保留项：" + i);
         }
     }
     private void validateDirectory(int directory, boolean[] visited) {
@@ -173,6 +176,7 @@ public class FileSystem {
     public void format() {
         disk.clear();
         Arrays.fill(fat, (byte) DiskLayout.FAT_FREE);
+        Arrays.fill(fat, disk.blockCount(), fat.length, (byte) DiskLayout.FAT_RESERVED);
         // FAT 自身占用的块与根目录块标记为"系统保留"
         for (int i = DiskLayout.FAT_START_BLOCK; i < DiskLayout.FAT_START_BLOCK + DiskLayout.FAT_BLOCKS; i++) {
             fat[i] = (byte) DiskLayout.FAT_RESERVED;
@@ -213,7 +217,7 @@ public class FileSystem {
      * 几块为系统数据区"，因此扫描从 {@link DiskLayout#FIRST_DATA_BLOCK} 开始。</p>
      */
     public int allocateBlock() {
-        for (int i = DiskLayout.FIRST_DATA_BLOCK; i < DiskLayout.FAT_ENTRIES; i++) {
+        for (int i = DiskLayout.FIRST_DATA_BLOCK; i < disk.blockCount(); i++) {
             if (fat[i] == DiskLayout.FAT_FREE) {
                 fat[i] = (byte) DiskLayout.FAT_EOC; // 先当作链尾，由调用者按需串联
                 flushFat();
@@ -244,7 +248,7 @@ public class FileSystem {
         int cur = startBlock;
         boolean[] seen = new boolean[fat.length];
         while (true) {
-            if (cur < DiskLayout.FIRST_DATA_BLOCK && cur != DiskLayout.ROOT_BLOCK || cur >= fat.length || cur < 0 || seen[cur])
+            if (cur < DiskLayout.FIRST_DATA_BLOCK && cur != DiskLayout.ROOT_BLOCK || cur >= disk.blockCount() || cur < 0 || seen[cur])
                 throw new IllegalStateException("FAT链包含非法盘块或循环，起点：" + startBlock);
             seen[cur] = true;
             out.add(cur);
@@ -257,7 +261,7 @@ public class FileSystem {
     /** 已分配盘块数（不含系统区）。 */
     public int usedBlocks() {
         int n = 0;
-        for (int i = DiskLayout.FIRST_DATA_BLOCK; i < DiskLayout.FAT_ENTRIES; i++) {
+        for (int i = DiskLayout.FIRST_DATA_BLOCK; i < disk.blockCount(); i++) {
             if (fat[i] != DiskLayout.FAT_FREE) {
                 n++;
             }
@@ -754,6 +758,7 @@ public class FileSystem {
 
     /** 要求路径是存在的目录，返回其起始盘块。 */
     public int requireDir(String path) {
+        if (normalize(path).equals("/")) return DiskLayout.ROOT_BLOCK;
         FileEntry e = require(path);
         if (!e.isDirectory()) {
             throw new IllegalStateException("不是目录：" + path);
@@ -769,6 +774,49 @@ public class FileSystem {
         }
         byte[] data = readAll(src);
         createFile(dstPath, src.attributes() & ~DiskLayout.ATTR_SYSTEM, data);
+    }
+
+    /** 移动/重命名只修改目录项，保留原FAT链；目标已存在时拒绝覆盖。 */
+    public String move(String source, String target) {
+        String src = normalize(source);
+        String requested = normalize(target);
+        if (src.equals("/")) throw new IllegalArgumentException("根目录不能移动");
+        FileEntry entry = require(src);
+        FileEntry targetEntry = resolve(requested);
+        String dst = requested.equals("/") || targetEntry != null && targetEntry.isDirectory()
+                ? normalize(requested + "/" + entry.displayName()) : requested;
+        if (src.equals(dst)) return dst;
+        if (entry.isReadonly()) throw new IllegalStateException("只读文件或目录禁止移动：" + src);
+        String lowerSrc = src.toLowerCase(java.util.Locale.ROOT);
+        String lowerDst = dst.toLowerCase(java.util.Locale.ROOT);
+        if (entry.isDirectory() && lowerDst.startsWith(lowerSrc + "/"))
+            throw new IllegalArgumentException("不能将目录移动到自身或其子目录");
+        String name = baseName(dst), ext = extensionOf(dst);
+        checkName(name, ext);
+        if (entry.isDirectory() && !ext.isEmpty()) throw new IllegalArgumentException("目录没有扩展名");
+        int from = parentDirBlock(src), to = parentDirBlock(dst);
+        FileEntry existing = resolve(dst);
+        if (existing != null && !src.equalsIgnoreCase(dst)) throw new IllegalStateException("目标已存在：" + dst);
+        return transaction(() -> {
+            // 同目录先腾出自己的槽位，满目录中的改名也无需申请新盘块。
+            if (from == to) clearEntry(from, entry.displayName());
+            addEntry(to, name, ext, entry.attributes(), entry.startBlock(), entry.length());
+            if (from != to) clearEntry(from, entry.displayName());
+            return dst;
+        });
+    }
+
+    /** 从当前分区尾部划出新分区；只能截取未使用的盘块。由分区管理器统一回滚。 */
+    void shrinkPartition(int newCount) {
+        if (newCount < DiskLayout.FIRST_DATA_BLOCK + 1 || newCount >= disk.blockCount())
+            throw new IllegalArgumentException("剩余分区至少需要6块");
+        for (int i = newCount; i < disk.blockCount(); i++) {
+            if (fatAt(i) != DiskLayout.FAT_FREE) throw new IllegalStateException("分区尾部有已用盘块，不能划分：" + i);
+        }
+        Arrays.fill(fat, newCount, fat.length, (byte) DiskLayout.FAT_RESERVED);
+        disk.selectPartition(disk.firstBlock(), newCount);
+        flushFat();
+        bump();
     }
 
     // ==================================================================

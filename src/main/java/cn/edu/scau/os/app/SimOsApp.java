@@ -110,7 +110,7 @@ public final class SimOsApp {
         String message = "无法加载模拟磁盘：\n" + disk.toAbsolutePath()
                 + "\n\n原因：" + reason
                 + "\n\n「备份并重建」会把当前磁盘改名为\n" + backup.getFileName()
-                + "\n然后重新生成演示数据（磁盘里的原有文件会全部丢失）。\n"
+                + "\n原盘及存在的分区表完整保留在备份中，新盘重新生成演示数据。\n"
                 + "「退出」不会修改任何文件。";
         // 用固定宽度的 HTML 包一层：路径/异常信息很长时自动换行，不被对话框右缘裁掉
         javax.swing.JLabel content = new javax.swing.JLabel(

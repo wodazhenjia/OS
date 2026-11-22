@@ -6,7 +6,7 @@ rem  用法：
 rem    run.bat                编译并启动图形界面
 rem    run.bat selftest [N]   编译并运行无界面自检（N 默认 600）
 rem    run.bat build          只编译打包，不运行
-rem    run.bat test           运行要求、健壮性、目录树和文本滚动回归测试
+rem    run.bat test           运行要求、健壮性、目录树、滚动与文件命令回归测试
 rem  需要完整 JDK 21：JAVA_HOME 指向低版本时会自动回退到
 rem  %USERPROFILE%\.jdks\ms-21.0.11，再回退到 PATH 上的 javac。
 rem ============================================================
@@ -98,6 +98,8 @@ if /i "%~1"=="test" (
     "%JAVA%" -Dstdout.encoding=UTF-8 -Djava.awt.headless=true -cp "target\classes;target\test-classes" cn.edu.scau.os.ui.DirectoryTreeRegressionTest
     if errorlevel 1 exit /b 1
     "%JAVA%" -Dstdout.encoding=UTF-8 -Djava.awt.headless=true -cp "target\classes;target\test-classes" cn.edu.scau.os.ui.TextAreaScrollRegressionTest
+    if errorlevel 1 exit /b 1
+    "%JAVA%" -Dstdout.encoding=UTF-8 -Djava.awt.headless=true -cp "target\classes;target\test-classes" cn.edu.scau.os.FileCommandRegressionTest
     if errorlevel 1 exit /b 1
     exit /b 0
 )

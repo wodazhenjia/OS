@@ -1,6 +1,7 @@
 package cn.edu.scau.os.app;
 
 import cn.edu.scau.os.kernel.Kernel;
+import cn.edu.scau.os.disk.PartitionManager;
 
 import java.io.IOException;
 import java.nio.file.AtomicMoveNotSupportedException;
@@ -41,25 +42,30 @@ public final class SafeBoot {
     public static Recovery recover(Path diskFile, Instant now) throws IOException {
         Path backup = uniqueBackup(diskFile, now);
         move(diskFile, backup);
-        Kernel kernel = new Kernel(diskFile);
+        Path table = PartitionManager.tablePath(diskFile);
+        Path tableBackup = PartitionManager.tablePath(backup);
+        boolean movedTable = false;
         try {
+            if (Files.exists(table)) { move(table, tableBackup); movedTable = true; }
+            Kernel kernel = new Kernel(diskFile);
             kernel.initialize(BOOT_SEED);
-        } catch (RuntimeException failure) {
+            return new Recovery(kernel, backup);
+        } catch (RuntimeException | IOException failure) {
             try {
                 Files.move(backup, diskFile, StandardCopyOption.REPLACE_EXISTING);
+                if (movedTable) Files.move(tableBackup, table, StandardCopyOption.REPLACE_EXISTING);
             } catch (IOException restoreFailure) {
                 failure.addSuppressed(restoreFailure);
             }
             throw failure;
         }
-        return new Recovery(kernel, backup);
     }
 
     /** 生成不与现有文件冲突的备份名。 */
     static Path uniqueBackup(Path diskFile, Instant now) {
         String stamp = STAMP.format(now);
         Path candidate = diskFile.resolveSibling("disk-broken-" + stamp + ".img");
-        for (int index = 1; Files.exists(candidate); index++) {
+        for (int index = 1; Files.exists(candidate) || Files.exists(PartitionManager.tablePath(candidate)); index++) {
             candidate = diskFile.resolveSibling("disk-broken-" + stamp + "-" + index + ".img");
         }
         return candidate;

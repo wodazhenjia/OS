@@ -12,6 +12,8 @@ public class VirtualDisk {
     public static final int BLOCK_COUNT = 256;
     public static final int TOTAL_BYTES = BLOCK_SIZE * BLOCK_COUNT;
     private final Path file;
+    private int firstBlock;
+    private int blockCount = BLOCK_COUNT;
     private long readOps;
     private long writeOps;
 
@@ -20,6 +22,16 @@ public class VirtualDisk {
     public long readOps() { return readOps; }
     public long writeOps() { return writeOps; }
     public boolean exists() { return Files.exists(file); }
+    public int firstBlock() { return firstBlock; }
+    public int blockCount() { return blockCount; }
+
+    /** 逻辑盘块映射到同一个物理 disk 文件中的连续分区。 */
+    public void selectPartition(int first, int count) {
+        if (first < 0 || count < DiskLayout.FIRST_DATA_BLOCK + 1 || first + count > BLOCK_COUNT)
+            throw new IllegalArgumentException("分区范围不合法");
+        firstBlock = first;
+        blockCount = count;
+    }
 
     public void validateSize() {
         try {
@@ -31,7 +43,7 @@ public class VirtualDisk {
         byte[] block = new byte[BLOCK_SIZE];
         try (FileChannel ch = FileChannel.open(file, StandardOpenOption.READ)) {
             ByteBuffer buffer = ByteBuffer.wrap(block);
-            long position = (long) blockNo * BLOCK_SIZE;
+            long position = (long) (firstBlock + blockNo) * BLOCK_SIZE;
             while (buffer.hasRemaining()) {
                 int n = ch.read(buffer, position);
                 if (n < 0) throw new IOException("盘块内容不完整：" + blockNo);
@@ -46,7 +58,7 @@ public class VirtualDisk {
         if (data.length != BLOCK_SIZE) throw new IllegalArgumentException("盘块必须为64字节");
         try (FileChannel ch = FileChannel.open(file, StandardOpenOption.WRITE)) {
             ByteBuffer buffer = ByteBuffer.wrap(data);
-            long position = (long) blockNo * BLOCK_SIZE;
+            long position = (long) (firstBlock + blockNo) * BLOCK_SIZE;
             while (buffer.hasRemaining()) position += ch.write(buffer, position);
             writeOps++;
         } catch (IOException e) { throw new UncheckedIOException("写磁盘失败：" + file, e); }
@@ -64,12 +76,16 @@ public class VirtualDisk {
     public void clear() {
         try {
             Files.createDirectories(file.getParent());
-            try (FileChannel ch = FileChannel.open(file, StandardOpenOption.CREATE,
-                    StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
+            boolean fresh = !Files.exists(file);
+            if (!fresh) validateSize();
+            try (FileChannel ch = FileChannel.open(file, StandardOpenOption.CREATE, StandardOpenOption.WRITE)) {
                 ByteBuffer zero = ByteBuffer.wrap(new byte[BLOCK_SIZE]);
-                for (int i = 0; i < BLOCK_COUNT; i++) {
+                int start = fresh ? 0 : firstBlock;
+                int count = fresh ? BLOCK_COUNT : blockCount;
+                for (int i = start; i < start + count; i++) {
                     zero.clear();
-                    while (zero.hasRemaining()) ch.write(zero);
+                    long position = (long) i * BLOCK_SIZE;
+                    while (zero.hasRemaining()) position += ch.write(zero, position);
                 }
                 ch.force(true);
             }
@@ -98,7 +114,7 @@ public class VirtualDisk {
     }
     public void flushAll() { flushDirty(); }
     private void checkBlock(int block) {
-        if (block < 0 || block >= BLOCK_COUNT) throw new IllegalArgumentException("非法盘块号：" + block);
+        if (block < 0 || block >= blockCount) throw new IllegalArgumentException("非法盘块号：" + block);
     }
     private void checkRange(int offset, int length) {
         if (offset < 0 || length < 0 || (long) offset + length > BLOCK_SIZE)
